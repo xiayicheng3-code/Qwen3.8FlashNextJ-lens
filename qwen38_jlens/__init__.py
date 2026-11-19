@@ -3,8 +3,11 @@
 from qwen38_jlens.checkpoint import (
     AsyncCheckpointManager,
     CheckpointConfig,
+    ConvergenceLogger,
+    export_neuronpedia_bundle,
     load_jlens_safetensors,
     peek_checkpoint_metadata,
+    publish_bundle_to_hf,
     save_jlens_safetensors,
 )
 from qwen38_jlens.engine import FitStats, Qwen38JLensEngine, valid_position_mask
@@ -17,6 +20,7 @@ from qwen38_jlens.ple_mmap import InMemoryPleProvider, MmapPleTable, PleHashSpec
 __all__ = [
     "AsyncCheckpointManager",
     "CheckpointConfig",
+    "ConvergenceLogger",
     "FitStats",
     "GatedDeltaRuleBackend",
     "HardwareProfile",
@@ -33,10 +37,12 @@ __all__ = [
     "build_offload_plan",
     "dequantize_fp8_blockwise",
     "detect_hardware",
+    "export_neuronpedia_bundle",
     "grouped_mm",
     "load_jlens_safetensors",
     "load_qwen38_streaming",
     "peek_checkpoint_metadata",
+    "publish_bundle_to_hf",
     "render_slice_html",
     "save_jlens_safetensors",
     "swiglu_vjp_pack",

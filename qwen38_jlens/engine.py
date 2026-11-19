@@ -502,17 +502,23 @@ class Qwen38JLensEngine:
         checkpoint_path: str | None = None,
         checkpoint_every: int = 10,
         checkpoint_manager: Any | None = None,
+        convergence_csv_path: str | None = None,
+        stop_at_delta: float | None = None,
+        min_prompts: int = 100,
+        stop_window: int = 10,
         resume: bool = True,
         on_prompt_done: Any = None,
     ) -> Qwen38JacobianLens:
         """Fit `J_l` over tokenized prompts `[1, T]` with zero-GPU-stall async checkpointing & resume.
 
-        Supports either:
-          - `checkpoint_manager=AsyncCheckpointManager(...)` (recommended: local NVMe + async Drive/HF Hub,
-            count + time triggers, single-file `.safetensors`, directly loadable as a lens on interrupt!), OR
+        Supports:
+          - `checkpoint_manager=AsyncCheckpointManager(...)` (recommended: Local NVMe + async Google Drive
+            during fitting, plus one-shot `publish_bundle_to_hf(...)` once complete!), OR
           - `checkpoint_path=".../ckpt.safetensors"` (or legacy `.pt`) for simple local checkpointing.
+          - Optional Neuronpedia-style convergence logging (`convergence_csv_path`) and early stopping
+            (`stop_at_delta=0.002`, `min_prompts=100`, `stop_window=10`).
         """
-        from qwen38_jlens.checkpoint import AsyncCheckpointManager, CheckpointConfig
+        from qwen38_jlens.checkpoint import AsyncCheckpointManager, CheckpointConfig, ConvergenceLogger
 
         n_layers = self.cfg.num_hidden_layers
         D = self.cfg.hidden_size
@@ -528,12 +534,12 @@ class Qwen38JLensEngine:
                         local_path=checkpoint_path,
                         every_n_prompts=max(1, checkpoint_every),
                         every_minutes=0.0,
-                        ckpt_dtype="float16",
+                        ckpt_dtype="float32",
                     )
                 )
                 owned_mgr = True
 
-        # ---- Resume from freshest checkpoint (Local / Drive / HF Hub or legacy .pt) ----
+        # ---- Resume from freshest checkpoint (Local / Drive or legacy .pt) ----
         jacobian_sum: dict[int, torch.Tensor]
         n_done: int
         next_idx: int
@@ -558,6 +564,10 @@ class Qwen38JLensEngine:
             n_done = 0
             next_idx = 0
         resumed_next_idx = next_idx
+
+        csv_path = convergence_csv_path or (mgr.cfg.local_convergence_csv if mgr is not None else None)
+        conv_logger = ConvergenceLogger(csv_path, resume_next_idx=next_idx) if csv_path else None
+        recent_deltas: list[float] = conv_logger.tail_deltas(stop_window) if conv_logger is not None else []
 
         def _save_legacy_pt() -> None:
             if checkpoint_path is None:
@@ -625,6 +635,11 @@ class Qwen38JLensEngine:
                     max_norm=max_norm,
                     mean_rel_change=rel_change,
                 )
+                if conv_logger is not None:
+                    conv_logger.append(n_done, stats)
+                if math.isfinite(rel_change):
+                    recent_deltas.append(rel_change)
+
                 logger.info(
                     "Prompt %d/%d  T=%d (valid=%d)  %.2fs (fwd=%.2fs bwd=%.2fs)  max||J||/sqrt(d)=%.3f  d_mean=%.2e",
                     p_idx + 1, len(tokenized_prompts), seq_len, n_valid,
@@ -647,6 +662,21 @@ class Qwen38JLensEngine:
                 elif mgr is None and checkpoint_path is not None and checkpoint_every > 0 and prompts_since_ckpt >= checkpoint_every:
                     _save_legacy_pt()
                     prompts_since_ckpt = 0
+
+                if (
+                    stop_at_delta is not None
+                    and stop_at_delta > 0.0
+                    and n_done >= min_prompts
+                    and len(recent_deltas) >= stop_window
+                    and all(d < stop_at_delta for d in recent_deltas[-stop_window:])
+                ):
+                    logger.info(
+                        "Converged early at n_done=%d (last %d mean_rel_change < %.4g); stopping cleanly.",
+                        n_done,
+                        stop_window,
+                        stop_at_delta,
+                    )
+                    break
 
         except KeyboardInterrupt:
             logger.warning("KeyboardInterrupt caught at next_idx=%d (n_done=%d); flushing checkpoint safely before exit!", next_idx, n_done)

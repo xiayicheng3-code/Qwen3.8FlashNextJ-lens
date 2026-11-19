@@ -133,35 +133,41 @@ print("Setup complete!")
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
-            """## 2. Fitting Configuration & Crash-Proof Async Checkpointing
-Checkpoints are stored as a **single `.safetensors` file** holding the running mean `J_mean = jacobian_sum / n_done` (plus `n_done`, `next_idx`, and layer metadata in the safetensors header):
-- **2× smaller (`2.34 GiB` in `float16` vs `4.69 GiB` in `float32`)** with zero fp16 overflow risk for any `n_prompts`.
-- **Zero GPU stalls**: writes to local NVMe in `< 1 s`, then syncs asynchronously on a background thread to **Google Drive** and/or **Hugging Face Hub** (recommended — free unlimited LFS/Xet storage at ~300–800 MB/s, avoiding Google Drive's 15 GB free quota!).
-- **Immediately usable on disconnect**: any interrupted checkpoint can be loaded directly as a valid `Qwen38JacobianLens`, and re-running automatically resumes from whichever copy (Local / Drive / HF Hub) has the highest `next_idx`."""
+            """## 2. Fitting Configuration, Async Drive Checkpointing & Neuronpedia Publish Settings
+Clean **split-role persistence** (never wastes outbound bandwidth uploading to both Drive and HF mid-run, and keeps your Hugging Face repo history to a single clean commit):
+1. **During fitting → Local NVMe (`< 1 s`) + Async Google Drive ONLY**:
+   - Stores running mean `J_mean = jacobian_sum / n_done` in a single `.safetensors` file (`float32` = `4.69 GiB` bit-exact resume by default for Google AI Pro 5 TB Drive; `float16` = `2.34 GiB` available for free 15 GB Drive).
+   - Background Drive copy + `convergence.csv` mirror run on a worker thread with **0 s GPU stall** and zero HF commit-rate-limit exposure.
+   - Any interrupted checkpoint is immediately loadable via `Qwen38JacobianLens.load(ckpt_path)` and auto-resumes seamlessly across disconnects.
+2. **After fitting (or merging shards) → One-Shot Neuronpedia-Ready Publish to Hugging Face Hub (Cell 9)**:
+   - Exports `Qwen3.8-Flash-Next-FP8_jacobian_lens.pt` (`fp16`, Neuronpedia drop-in schema + `provenance`), `Qwen3.8-Flash-Next-FP8_jacobian_lens_4branch.safetensors` (full lossless 4-branch `[2560, 10240]`), `convergence.csv`, `config.yaml`, and `CREDIT.md`, then uploads the folder in **one single clean commit**."""
         )
     )
     cells.append(
         new_code_cell(
-            """#@title Qwen3.8-Flash-Next J-Lens & Checkpoint Configuration { display-mode: "form" }
+            """#@title Qwen3.8-Flash-Next J-Lens, Checkpoint & Publish Configuration { display-mode: "form" }
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next-FP8"  #@param {type:"string"}
-N_PROMPTS = 100              #@param {type:"integer"}  # 100 = usable lens (paper §9.3); 1000 = full paper lens
+N_PROMPTS = 100              #@param {type:"integer"}  # 100 = usable lens; 1000 w/ STOP_AT_DELTA=0.002 = full Neuronpedia recipe
 PROMPT_OFFSET = 0            #@param {type:"integer"}  # Shift start index to shard across parallel Colab sessions & merge()
 MAX_SEQ_LEN = 128            #@param {type:"integer"}  # Paper default: 128 tokens (keeps full K=2560 in 1 sweep!)
 SKIP_FIRST = 16              #@param {type:"integer"}  # Exclude attention-sink prefix tokens (paper default: 16)
 LAYER_STRIDE = 1             #@param {type:"integer"}  # 1 = all 48 layers (0..47); 2 = every 2nd layer
+STOP_AT_DELTA = 0.0          #@param {type:"number"}   # 0.0 = fixed N_PROMPTS; set 0.002 for Neuronpedia early stopping (after 100 prompts)
 PLE_MODE = "auto"            #@param ["auto", "mmap", "preextract"]
 
-#@markdown ### Async Checkpointing (Zero GPU Stall)
-CKPT_DTYPE = "float16"       #@param ["float16", "float32"]  # float16 = 2.34 GiB (recommended); float32 = 4.69 GiB exact
-CHECKPOINT_EVERY_PROMPTS = 10 #@param {type:"integer"}        # Trigger checkpoint every N prompts
-CHECKPOINT_EVERY_MINUTES = 10.0 #@param {type:"number"}       # OR every M minutes (whichever comes first)
-SAVE_TO_GOOGLE_DRIVE = True  #@param {type:"boolean"}         # Async mirror to Google Drive (only 2.34 GiB in fp16!)
+#@markdown ### During Fitting: Async Google Drive Checkpointing (Zero GPU Stall)
+SAVE_TO_GOOGLE_DRIVE = True  #@param {type:"boolean"}         # Recommended: Drive-only during fitting (no mid-run HF bandwidth split!)
 DRIVE_OUT_DIR = "/content/drive/MyDrive/qwen38_jlens_out" #@param {type:"string"}
-HF_CHECKPOINT_REPO = ""      #@param {type:"string"}          # Optional e.g. "your-name/qwen38-jlens-ckpt" (unlimited storage, fastest!)
-HF_REPO_PRIVATE = True       #@param {type:"boolean"}
-ALSO_SAVE_LEGACY_PT = False  #@param {type:"boolean"}         # Also write `.pt` alongside `.safetensors` (doubles disk/Drive size)
+CKPT_DTYPE = "float32"       #@param ["float32", "float16"]  # float32 = 4.69 GiB bit-exact resume (best for 5TB Drive); float16 = 2.34 GiB
+CHECKPOINT_EVERY_PROMPTS = 15 #@param {type:"integer"}        # Trigger checkpoint every N prompts
+CHECKPOINT_EVERY_MINUTES = 10.0 #@param {type:"number"}       # OR every M minutes (whichever comes first)
 LOCAL_WORK_DIR = "/content/qwen38_work" #@param {type:"string"}
-HF_TOKEN = ""                #@param {type:"string"}
+
+#@markdown ### After Fitting: One-Shot Neuronpedia-Ready Publish to Hugging Face Hub (Cell 9)
+HF_PUBLISH_REPO = ""         #@param {type:"string"}          # e.g. "your-username/qwen3.8-flash-next-jlens" (single clean commit at the end!)
+HF_PUBLISH_PRIVATE = False   #@param {type:"boolean"}
+AUTHOR_NAME = ""             #@param {type:"string"}          # Recorded in CREDIT.md, config.yaml, and .pt provenance
+HF_TOKEN = ""                #@param {type:"string"}          # Or store HF_TOKEN in Colab Secrets
 
 import os
 os.makedirs(LOCAL_WORK_DIR, exist_ok=True)
@@ -179,7 +185,7 @@ if not HF_TOKEN:
     except Exception:
         HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_TOKEN = HF_TOKEN or None
-HF_CHECKPOINT_REPO = HF_CHECKPOINT_REPO.strip() or None
+HF_PUBLISH_REPO = HF_PUBLISH_REPO.strip() or None
 
 DRIVE_ENABLED = False
 if SAVE_TO_GOOGLE_DRIVE:
@@ -189,23 +195,27 @@ if SAVE_TO_GOOGLE_DRIVE:
         os.makedirs(DRIVE_OUT_DIR, exist_ok=True)
         DRIVE_ENABLED = True
     except Exception as exc:
-        print(f"Google Drive mount unavailable ({exc}); using local NVMe (+ HF Hub if configured).")
+        print(f"Google Drive mount unavailable ({exc}); saving checkpoints to local NVMe only.")
 
 TAG = f"off{PROMPT_OFFSET}_n{N_PROMPTS}_s{LAYER_STRIDE}"
 CKPT_FILENAME = f"qwen38_jlens_ckpt_{TAG}.safetensors"
-LENS_FILENAME = f"qwen38_flash_next_jlens_{TAG}.safetensors"
+CONV_FILENAME = f"qwen38_jlens_convergence_{TAG}.csv"
 
 LOCAL_CKPT_PATH = os.path.join(LOCAL_CKPT_DIR, CKPT_FILENAME)
 DRIVE_CKPT_PATH = os.path.join(DRIVE_OUT_DIR, CKPT_FILENAME) if DRIVE_ENABLED else None
-FINAL_LENS_LOCAL = os.path.join(LOCAL_CKPT_DIR, LENS_FILENAME)
-FINAL_LENS_DRIVE = os.path.join(DRIVE_OUT_DIR, LENS_FILENAME) if DRIVE_ENABLED else None
+LOCAL_CONV_CSV = os.path.join(LOCAL_CKPT_DIR, CONV_FILENAME)
+DRIVE_CONV_CSV = os.path.join(DRIVE_OUT_DIR, CONV_FILENAME) if DRIVE_ENABLED else None
 OUT_DIR = DRIVE_OUT_DIR if DRIVE_ENABLED else LOCAL_CKPT_DIR
+BUNDLE_REL_DIR = "qwen3.8-flash-next/jlens/Salesforce-wikitext"
+BUNDLE_DIR = os.path.join(OUT_DIR, f"release_{TAG}", BUNDLE_REL_DIR)
 
-print("Checkpoint Destinations:")
-print(f"  Local NVMe (fast <1s) : {LOCAL_CKPT_PATH}")
-print(f"  Google Drive (async)  : {DRIVE_CKPT_PATH or 'disabled'}")
-print(f"  HF Hub (async Xet)    : {f'{HF_CHECKPOINT_REPO}/{CKPT_FILENAME}' if HF_CHECKPOINT_REPO else 'disabled'}")
-print(f"  Cadence & Dtype       : every {CHECKPOINT_EVERY_PROMPTS} prompts or {CHECKPOINT_EVERY_MINUTES} min | {CKPT_DTYPE}")
+print("Persistence & Publishing Plan:")
+print(f"  Mid-run Local NVMe    : {LOCAL_CKPT_PATH} (<1s atomic write)")
+print(f"  Mid-run Google Drive  : {DRIVE_CKPT_PATH or 'disabled'} (async background copy, {CKPT_DTYPE})")
+print(f"  Convergence CSV       : {DRIVE_CONV_CSV or LOCAL_CONV_CSV}")
+print(f"  Checkpoint Cadence    : every {CHECKPOINT_EVERY_PROMPTS} prompts or {CHECKPOINT_EVERY_MINUTES} min")
+print(f"  Final Release Bundle  : {BUNDLE_DIR}")
+print(f"  One-Shot HF Publish   : {f'{HF_PUBLISH_REPO}/{BUNDLE_REL_DIR}' if HF_PUBLISH_REPO else 'not set (configure HF_PUBLISH_REPO for Cell 9)'}")
 """
         )
     )
@@ -429,26 +439,30 @@ print(f"  Live Telemetry    : VRAM alloc={vram_used:.1f} GiB | RAM used={ram_use
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
-            """## 7. Fit Qwen3.8-Flash-Next Jacobian Lens (`J_l ∈ R^{2560 × 10240}`) with Zero-Stall Async Checkpointing
-- Saves `J_mean` as a single `.safetensors` file (`2.34 GiB` in `fp16`) to local NVMe in `< 1 s`, then syncs in the background to Google Drive and/or Hugging Face Hub with **0 s GPU stall**.
-- Interrupting the cell (`Stop` / `KeyboardInterrupt`) cleanly flushes the latest checkpoint before exiting.
-- Re-running after any Colab disconnect automatically resumes from whichever target (Local / Drive / HF Hub) has the highest `next_idx`!"""
+            """## 7. Fit Qwen3.8-Flash-Next Jacobian Lens (`J_l ∈ R^{2560 × 10240}`) with Async Drive Checkpointing
+- Writes `J_mean` `.safetensors` to local NVMe in `< 1 s`, then copies asynchronously to **Google Drive only** (+ `convergence.csv`) with **0 s GPU stall** and zero HF Hub commit clutter.
+- Interrupting the cell (`Stop` / `KeyboardInterrupt`) cleanly flushes local NVMe + Google Drive before exiting.
+- On completion, exports a complete **Neuronpedia-ready release bundle** (`.pt` fp16 + 4-branch `.safetensors` + `convergence.csv` + `config.yaml` + `CREDIT.md`)."""
         )
     )
     cells.append(
         new_code_cell(
-            """import os, shutil, time, torch
+            """import os, time, torch
 from tqdm.auto import tqdm
-from qwen38_jlens import AsyncCheckpointManager, CheckpointConfig, peek_checkpoint_metadata
+from qwen38_jlens import (
+    AsyncCheckpointManager,
+    CheckpointConfig,
+    export_neuronpedia_bundle,
+    peek_checkpoint_metadata,
+)
 
 ckpt_mgr = AsyncCheckpointManager(
     CheckpointConfig(
         local_path=LOCAL_CKPT_PATH,
         drive_path=DRIVE_CKPT_PATH,
-        hf_repo_id=HF_CHECKPOINT_REPO,
-        hf_path_in_repo=CKPT_FILENAME,
-        hf_token=HF_TOKEN,
-        hf_private=HF_REPO_PRIVATE,
+        local_convergence_csv=LOCAL_CONV_CSV,
+        drive_convergence_csv=DRIVE_CONV_CSV,
+        hf_repo_id=None,  # Keep HF Hub clean during fitting; publish in ONE commit in Cell 9!
         ckpt_dtype=CKPT_DTYPE,
         every_n_prompts=CHECKPOINT_EVERY_PROMPTS,
         every_minutes=CHECKPOINT_EVERY_MINUTES,
@@ -456,7 +470,6 @@ ckpt_mgr = AsyncCheckpointManager(
     )
 )
 
-# Quick preview of existing checkpoints before starting
 for lbl, p in (("Local NVMe", LOCAL_CKPT_PATH), ("Google Drive", DRIVE_CKPT_PATH)):
     meta = peek_checkpoint_metadata(p) if p else None
     if meta:
@@ -490,6 +503,9 @@ try:
         source_layers=SOURCE_LAYERS,
         skip_first=SKIP_FIRST,
         checkpoint_manager=ckpt_mgr,
+        stop_at_delta=(STOP_AT_DELTA if STOP_AT_DELTA > 0 else None),
+        min_prompts=100,
+        stop_window=10,
         resume=True,
         on_prompt_done=_on_prompt,
     )
@@ -497,38 +513,34 @@ finally:
     pbar.close()
     ckpt_mgr.close()
 
-# Save final lens (.safetensors with collapsed J included; optional legacy .pt)
-lens.save(FINAL_LENS_LOCAL, dtype=torch.float16, include_collapsed=True)
-if FINAL_LENS_DRIVE:
-    shutil.copyfile(FINAL_LENS_LOCAL, FINAL_LENS_DRIVE + ".tmp")
-    os.replace(FINAL_LENS_DRIVE + ".tmp", FINAL_LENS_DRIVE)
-
-if ALSO_SAVE_LEGACY_PT:
-    pt_path = os.path.join(OUT_DIR, f"qwen38_flash_next_jlens_{TAG}.pt")
-    lens.save(pt_path, dtype=torch.float16, include_collapsed=True)
-    print(f"Saved legacy .pt lens: {pt_path}")
-
-if HF_CHECKPOINT_REPO:
-    from huggingface_hub import HfApi
-    _hf_api = HfApi(token=HF_TOKEN)
-    _hf_api.create_repo(
-        repo_id=HF_CHECKPOINT_REPO,
-        repo_type="model",
-        private=HF_REPO_PRIVATE,
-        exist_ok=True,
-    )
-    _hf_api.upload_file(
-        path_or_fileobj=FINAL_LENS_LOCAL,
-        path_in_repo=LENS_FILENAME,
-        repo_id=HF_CHECKPOINT_REPO,
-        repo_type="model",
-        commit_message=f"Final Qwen3.8-Flash-Next J-lens (n={lens.n_prompts})",
-    )
-    print(f"Uploaded final lens to HF Hub: {HF_CHECKPOINT_REPO}/{LENS_FILENAME}")
+# Export complete Neuronpedia-ready bundle locally / to Google Drive
+bundle_files = export_neuronpedia_bundle(
+    lens,
+    BUNDLE_DIR,
+    np_model_id="qwen3.8-flash-next",
+    hf_model_name=MODEL_ID,
+    file_prefix="Qwen3.8-Flash-Next-FP8",
+    author=AUTHOR_NAME,
+    dataset_name="Salesforce/wikitext",
+    dataset_config="wikitext-103-raw-v1",
+    dataset_split="train",
+    max_seq_len=MAX_SEQ_LEN,
+    skip_first=SKIP_FIRST,
+    prompt_offset=PROMPT_OFFSET,
+    stop_at_delta=(STOP_AT_DELTA if STOP_AT_DELTA > 0 else None),
+    convergence_csv_path=LOCAL_CONV_CSV,
+    gpu_name=profile.gpu_name,
+    gpu_vram_gib=profile.gpu_vram_total_gib,
+    gdn_kernel=engine.gdn_backend.name,
+    include_4branch_safetensors=True,
+)
 
 total_min = (time.perf_counter() - t_fit) / 60.0
 peak_vram = torch.cuda.max_memory_allocated() / 1024**3
-print(f"\\nSaved final lens: {FINAL_LENS_DRIVE or FINAL_LENS_LOCAL}")
+print(f"\\nExported Neuronpedia-ready release bundle -> {BUNDLE_DIR}")
+for k, p in bundle_files.items():
+    sz_mb = os.path.getsize(p) / 1024**2
+    print(f"  [{k:24s}] {os.path.basename(p)} ({sz_mb:.1f} MiB)")
 print(f"  Summary   : {lens}")
 print(f"  Total time: {total_min:.2f} min ({(total_min*60)/max(1, len(times)):.2f} s/prompt)")
 print(f"  Peak VRAM : {peak_vram:.2f} GiB")
@@ -598,26 +610,58 @@ display(HTML(render_slice_html(tok_strs, layer_top1, model_top1, title=f"Qwen3.8
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 16: Multi-Session Sharded Merge & Loading Interrupted Checkpoints
+    # Cell 16: Merge Parallel Shards & One-Shot Publish to Hugging Face / Neuronpedia
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
-            """## 9. (Optional) Merge Parallel Colab Shards (`n = 1000`) or Use an Interrupted Checkpoint Directly
-- Because checkpoints store `J_mean` + `n_done` in `.safetensors`, **any interrupted checkpoint** can be loaded directly via `Qwen38JacobianLens.load(ckpt_path)`.
-- Run multiple Colab sessions with `PROMPT_OFFSET = 0, 100, 200, ...` pointing to the same Drive folder or HF Hub repo, then merge them into one exact `n_prompts`-weighted lens."""
+            """## 9. One-Shot Publish to Hugging Face Hub (Neuronpedia-Ready) & Optional Shard Merge
+- Uploads the **entire release folder in ONE single clean commit** (`_jacobian_lens.pt` fp16 + `_4branch.safetensors` + `_convergence.csv` + `config.yaml` + `CREDIT.md`) — zero rate-limit risk and clean Git history for contributing to [`neuronpedia/jacobian-lens`](https://huggingface.co/neuronpedia/jacobian-lens).
+- If you ran parallel Colab shards (`PROMPT_OFFSET = 0, 200, 400, ...`), uncomment the merge block first to combine all Drive checkpoints into one exact `n_prompts`-weighted bundle before publishing."""
         )
     )
     cells.append(
         new_code_cell(
-            """# Uncomment to merge multiple sharded `.safetensors` lenses (or interrupted checkpoints!):
-# import glob
-# from qwen38_jlens import Qwen38JacobianLens
-# shard_files = sorted(glob.glob(f"{OUT_DIR}/qwen38_flash_next_jlens_off*.safetensors"))
-# print("Merging:", shard_files)
-# merged = Qwen38JacobianLens.merge([Qwen38JacobianLens.load(p) for p in shard_files])
-# merged_path = f"{OUT_DIR}/qwen38_flash_next_jlens_merged_n{merged.n_prompts}.safetensors"
-# merged.save(merged_path, include_collapsed=True)
-# print("Saved merged lens:", merged_path, merged)
+            """import glob, os
+from qwen38_jlens import Qwen38JacobianLens, export_neuronpedia_bundle, publish_bundle_to_hf
+
+PUBLISH_DIR = BUNDLE_DIR
+PUBLISH_LENS = lens
+
+# ---- (Optional) Merge multiple parallel Drive shards before publishing ----
+# shard_ckpts = sorted(glob.glob(f"{OUT_DIR}/qwen38_jlens_ckpt_off*.safetensors"))
+# print("Merging shards:", shard_ckpts)
+# merged_lens = Qwen38JacobianLens.merge([Qwen38JacobianLens.load(p) for p in shard_ckpts])
+# PUBLISH_LENS = merged_lens
+# PUBLISH_DIR = os.path.join(OUT_DIR, f"release_merged_n{merged_lens.n_prompts}", BUNDLE_REL_DIR)
+# export_neuronpedia_bundle(
+#     merged_lens,
+#     PUBLISH_DIR,
+#     np_model_id="qwen3.8-flash-next",
+#     hf_model_name=MODEL_ID,
+#     file_prefix="Qwen3.8-Flash-Next-FP8",
+#     author=AUTHOR_NAME,
+#     max_seq_len=MAX_SEQ_LEN,
+#     skip_first=SKIP_FIRST,
+#     gpu_name=profile.gpu_name,
+#     gpu_vram_gib=profile.gpu_vram_total_gib,
+#     gdn_kernel=engine.gdn_backend.name,
+# )
+# print("Exported merged Neuronpedia bundle:", PUBLISH_DIR, merged_lens)
+
+# ---- One-shot single-commit publish to Hugging Face Hub ----
+if HF_PUBLISH_REPO:
+    commit_url = publish_bundle_to_hf(
+        PUBLISH_DIR,
+        HF_PUBLISH_REPO,
+        path_in_repo=BUNDLE_REL_DIR,
+        token=HF_TOKEN,
+        private=HF_PUBLISH_PRIVATE,
+        commit_message=f"Publish Qwen3.8-Flash-Next Jacobian Lens (n={PUBLISH_LENS.n_prompts}, Neuronpedia format)",
+    )
+    print(f"Published in a single clean HF commit -> {commit_url}")
+else:
+    print(f"HF_PUBLISH_REPO is empty. Your Neuronpedia-ready bundle is saved locally/on Drive at:\\n  {PUBLISH_DIR}")
+    print("Set HF_PUBLISH_REPO = 'your-username/qwen3.8-flash-next-jlens' in Cell 2 and re-run this cell to publish!")
 
 # Optional cleanup of temporary local NVMe slabs / PLE shards:
 # engine.close()

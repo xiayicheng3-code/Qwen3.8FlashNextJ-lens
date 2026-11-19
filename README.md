@@ -48,17 +48,17 @@ Automatically detects whichever Google Colab High-RAM runtime is randomly assign
 
 ---
 
-## Crash-Proof Zero-Stall Checkpointing
+## Crash-Proof Zero-Stall Checkpointing & Neuronpedia Publishing
 
-Naively calling `torch.save(jacobian_sum, "/content/drive/...")` writes a **4.69 GiB** fp32 pickle zip (`~10 GB` transient Drive quota) and stalls the GPU for **80–180 s** over Google Drive FUSE every few prompts.
+Naively calling `torch.save(jacobian_sum, "/content/drive/...")` blocks the GPU for **80–180 s** over Google Drive FUSE, while double-uploading mid-run checkpoints to both Drive and Hugging Face splits Colab outbound NIC bandwidth and bloats Git commit history.
 
-Instead, `AsyncCheckpointManager` ([`qwen38_jlens/checkpoint.py`](./qwen38_jlens/checkpoint.py)):
-1. **Stores running mean `J_mean = jacobian_sum / n_done` in a single `.safetensors` file** with `n_done`, `next_idx`, `source_layers`, and `branch_norms` embedded in the safetensors `__metadata__` header:
-   - **`2.34 GiB` in `float16`** (2× smaller, zero fp16 overflow for any `n_prompts`; optional `float32` = `4.69 GiB`).
-   - **Immediately usable on disconnect**: any interrupted checkpoint loads directly via `Qwen38JacobianLens.load(ckpt_path)`.
-2. **Writes to local NVMe in `< 1 s`, then hardlinks and uploads asynchronously on a background thread** to **Google Drive** and/or **Hugging Face Hub** (`HF_CHECKPOINT_REPO` — free unlimited Xet storage at ~300–800 MB/s, avoiding Drive's 15 GB free quota) with **0 s GPU blocking**.
-3. **Time + count triggers + `KeyboardInterrupt` flush**: checkpoints every `N` prompts or `M` minutes, skips overlapping background uploads without piling up, and flushes cleanly if you stop the cell.
-4. **Multi-source auto-resume**: on restart, peeks Local NVMe, Google Drive, and HF Hub headers (`< 1 ms`) and resumes from whichever has the highest `next_idx`.
+Instead, [`qwen38_jlens/checkpoint.py`](./qwen38_jlens/checkpoint.py) uses a clean **split-role architecture**:
+1. **During fitting → Local NVMe (`< 1 s`) + Async Google Drive ONLY** (`AsyncCheckpointManager`):
+   - Saves running mean `J_mean = jacobian_sum / n_done` in a single `.safetensors` file (`float32` = `4.69 GiB` bit-exact resume by default for Google AI Pro 5 TB Drive; `float16` = `2.34 GiB` for free 15 GB Drive) with `n_done`, `next_idx`, `source_layers`, and `branch_norms` in the header.
+   - Streams layer-by-layer division (avoiding a 4.69 GiB transient CPU RAM spike on A100 40G), hardlinks locally, and copies asynchronously to Google Drive (+ `convergence.csv`) on a background thread with **0 s GPU stall** and zero HF commit-rate-limit risk.
+   - Supports time + count triggers, optional Neuronpedia convergence early stopping (`stop_at_delta=0.002`), clean `KeyboardInterrupt` flush, and direct loading of any interrupted checkpoint via `Qwen38JacobianLens.load(ckpt_path)`.
+2. **After fitting (or shard merge) → One-Shot Neuronpedia-Ready Publish to Hugging Face Hub** (`export_neuronpedia_bundle` + `publish_bundle_to_hf`):
+   - Exports a clean release folder (`_jacobian_lens.pt` fp16 drop-in `[2560, 2560]` collapsed map + `provenance`, `_jacobian_lens_4branch.safetensors` full lossless `[2560, 10240]`, `_convergence.csv`, `config.yaml`, `CREDIT.md`) and uploads it in **one single clean commit**.
 
 ---
 
@@ -70,11 +70,11 @@ Instead, `AsyncCheckpointManager` ([`qwen38_jlens/checkpoint.py`](./qwen38_jlens
 - [`qwen38_jlens/ple_mmap.py`](./qwen38_jlens/ple_mmap.py) — Zero-RAM `MmapPleTable`, exact SplitMix64 prime-vocab n-gram hasher, and `PreextractedPleProvider`.
 - [`qwen38_jlens/model_ops.py`](./qwen38_jlens/model_ops.py) — Exact `B = 1` forward + batched-cotangent analytical VJP for every `qwen4_exp` submodule.
 - [`qwen38_jlens/loader.py`](./qwen38_jlens/loader.py) — Streaming safetensors shard packer (Vision/MTP skip, split/fused FP8 expert handling, contiguous binary Tier-2 slabs, raw blob eviction).
-- [`qwen38_jlens/checkpoint.py`](./qwen38_jlens/checkpoint.py) — Zero-GPU-stall `AsyncCheckpointManager`: single-file `.safetensors` running-mean (`2.34 GiB` fp16 / `4.69 GiB` fp32), `<1 s` local NVMe write + background Google Drive / Hugging Face Hub sync, `KeyboardInterrupt` flush, and multi-source best-`next_idx` auto-resume.
+- [`qwen38_jlens/checkpoint.py`](./qwen38_jlens/checkpoint.py) — Zero-GPU-stall `AsyncCheckpointManager` (NVMe + async Drive + `ConvergenceLogger`) & single-commit Neuronpedia exporter/publisher (`export_neuronpedia_bundle`, `publish_bundle_to_hf`).
 - [`qwen38_jlens/engine.py`](./qwen38_jlens/engine.py) — `AsyncMoEStreamer` (background NVMe thread + pinned host ring + CUDA copy stream + GPU staging ring) & `Qwen38JLensEngine` fitter/applier.
 - [`qwen38_jlens/lens.py`](./qwen38_jlens/lens.py) — `Qwen38JacobianLens` (`save`, `load`, `merge`, `branch_norms`, `collapsed_jacobians`) & HTML slice renderer.
 - [`build_notebook.py`](./build_notebook.py) — Rebuilds `qwen38_jlens_colab.ipynb` deterministically from `qwen38_jlens/`.
-- [`tests/`](./tests/) — Pytest verification suite covering hardware plans, exact VJP parity against `torch.autograd.grad` across all operators and full 4-layer J-lens fitting, PLE mmap parity, Tier-2 NVMe slabs, checkpoint resume/merge, and notebook integrity.
+- [`tests/`](./tests/) — Pytest verification suite covering hardware plans, exact VJP parity against `torch.autograd.grad` across all operators and full 4-layer J-lens fitting, PLE mmap parity, Tier-2 NVMe slabs, checkpoint resume/early-stopping/Neuronpedia export, and notebook integrity.
 
 ## Running Tests Locally
 

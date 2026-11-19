@@ -11,11 +11,13 @@ import torch
 from qwen38_jlens.checkpoint import (
     AsyncCheckpointManager,
     CheckpointConfig,
+    ConvergenceLogger,
+    export_neuronpedia_bundle,
     load_jlens_safetensors,
     peek_checkpoint_metadata,
     save_jlens_safetensors,
 )
-from qwen38_jlens.engine import Qwen38JLensEngine
+from qwen38_jlens.engine import FitStats, Qwen38JLensEngine
 from qwen38_jlens.hardware import HardwareProfile, StorageTier, build_offload_plan
 from qwen38_jlens.lens import Qwen38JacobianLens
 from qwen38_jlens.loader import load_qwen38_streaming
@@ -51,13 +53,12 @@ def test_safetensors_checkpoint_roundtrip_and_direct_lens_load(tmp_path: Path):
     assert torch.allclose(reloaded.jacobians[1], lens.jacobians[1], atol=1e-4)
 
 
-def test_async_manager_picks_freshest_across_local_and_drive(tmp_path: Path):
+def test_async_manager_picks_freshest_across_local_and_drive(tmp_path: Path, caplog):
     local_p = str(tmp_path / "local" / "ckpt.safetensors")
     drive_p = str(tmp_path / "drive" / "ckpt.safetensors")
     os.makedirs(os.path.dirname(local_p), exist_ok=True)
     os.makedirs(os.path.dirname(drive_p), exist_ok=True)
 
-    # Stale local (next_idx=10) vs fresher Drive mirror (next_idx=25)
     save_jlens_safetensors(
         local_p, {0: torch.ones(8, 32)}, n_done=10, next_idx=10, skip_first=2, d_model=8, hc_count=4, dtype=torch.float32
     )
@@ -75,8 +76,16 @@ def test_async_manager_picks_freshest_across_local_and_drive(tmp_path: Path):
     assert torch.allclose(j_sum[0] / n_done, torch.full((8, 32), 2.5), atol=1e-6)
     mgr.close()
 
+    # Enabling BOTH Drive and HF simultaneously emits a clear shared-bandwidth warning
+    with caplog.at_level("WARNING"):
+        mgr_dual = AsyncCheckpointManager(
+            CheckpointConfig(local_path=local_p, drive_path=drive_p, hf_repo_id="user/dummy")
+        )
+        mgr_dual.close()
+    assert any("share outbound" in rec.message for rec in caplog.records)
 
-def test_engine_fit_async_checkpoint_resume_and_keyboard_interrupt(tmp_path: Path):
+
+def test_engine_fit_async_checkpoint_resume_csv_and_keyboard_interrupt(tmp_path: Path):
     ckpt_dir = tmp_path / "model"
     ckpt_dir.mkdir()
     _make_synthetic_fp8_checkpoint(ckpt_dir)
@@ -93,18 +102,21 @@ def test_engine_fit_async_checkpoint_resume_and_keyboard_interrupt(tmp_path: Pat
     prompts = [torch.randint(0, 62, (1, 20)) for _ in range(4)]
     local_ckpt = str(tmp_path / "local_ckpt.safetensors")
     drive_ckpt = str(tmp_path / "drive_ckpt.safetensors")
+    local_csv = str(tmp_path / "local_conv.csv")
+    drive_csv = str(tmp_path / "drive_conv.csv")
 
     mgr1 = AsyncCheckpointManager(
         CheckpointConfig(
             local_path=local_ckpt,
             drive_path=drive_ckpt,
+            local_convergence_csv=local_csv,
+            drive_convergence_csv=drive_csv,
             ckpt_dtype="float32",
-            every_n_prompts=10,  # Won't fire automatically before prompt 2; KeyboardInterrupt must flush!
+            every_n_prompts=10,
             every_minutes=0.0,
         )
     )
 
-    # Simulate user pressing Stop (KeyboardInterrupt) right after prompt 2 finishes!
     def _interrupt_after_two(stats):
         if stats.prompt_idx == 1:
             raise KeyboardInterrupt("Simulated Colab stop")
@@ -113,16 +125,20 @@ def test_engine_fit_async_checkpoint_resume_and_keyboard_interrupt(tmp_path: Pat
         engine.fit(prompts, skip_first=2, checkpoint_manager=mgr1, resume=False, on_prompt_done=_interrupt_after_two)
     mgr1.close()
 
-    # Verify BOTH local NVMe AND Drive mirror were safely flushed on KeyboardInterrupt!
+    # Verify BOTH Drive checkpoint AND Drive convergence CSV were safely flushed on KeyboardInterrupt!
     meta_drive = peek_checkpoint_metadata(drive_ckpt)
     assert meta_drive is not None and meta_drive["n_done"] == 2 and meta_drive["next_idx"] == 2
+    assert os.path.isfile(drive_csv)
 
-    # Delete local NVMe (simulating brand-new Colab VM!) -> must auto-resume from Drive mirror!
+    # Delete local NVMe checkpoint + CSV (simulating brand-new Colab VM!) -> auto-resume from Drive!
     os.unlink(local_ckpt)
+    os.unlink(local_csv)
     mgr2 = AsyncCheckpointManager(
         CheckpointConfig(
             local_path=local_ckpt,
             drive_path=drive_ckpt,
+            local_convergence_csv=local_csv,
+            drive_convergence_csv=drive_csv,
             ckpt_dtype="float32",
             every_n_prompts=1,
             every_minutes=0.0,
@@ -132,10 +148,66 @@ def test_engine_fit_async_checkpoint_resume_and_keyboard_interrupt(tmp_path: Pat
     mgr2.close()
     assert lens_resumed.n_prompts == 4
 
+    # Verify unbroken 4-row convergence CSV across the disconnect (header + 4 rows, no duplicates!)
+    rows = Path(drive_csv).read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 5  # header + prompts 0, 1, 2, 3
+
     # Compare against uninterrupted reference fit
     lens_ref = engine.fit(prompts, skip_first=2, resume=False)
     for l in (0, 1):
         assert torch.allclose(lens_resumed.jacobians[l], lens_ref.jacobians[l], atol=1e-5)
 
+    # Test early stopping (`stop_at_delta`) with identical prompts so delta drops immediately below threshold
+    same_prompts = [prompts[0].clone() for _ in range(6)]
+    lens_early = engine.fit(same_prompts, skip_first=2, stop_at_delta=1.0, min_prompts=2, stop_window=2, resume=False)
+    assert lens_early.n_prompts == 3  # prompt 0 (nan), prompt 1 (d1<1), prompt 2 (d2<1) -> stops at n=3 < 6!
+
+    # Test Neuronpedia bundle export (drop-in .pt weights_only=True + full 4-branch .safetensors + CSV + config.yaml + CREDIT.md)
+    bundle_dir = str(tmp_path / "bundle" / "qwen3.8-flash-next" / "jlens" / "Salesforce-wikitext")
+    written = export_neuronpedia_bundle(
+        lens_resumed,
+        bundle_dir,
+        author="Test Author",
+        max_seq_len=20,
+        skip_first=2,
+        convergence_csv_path=drive_csv,
+        gpu_name="NVIDIA A100-SXM4-80GB",
+        gpu_vram_gib=79.2,
+        gdn_kernel="fla",
+    )
+    assert set(written.keys()) == {"neuronpedia_pt", "full_4branch_safetensors", "convergence_csv", "config_yaml", "credit_md"}
+
+    pt_data = torch.load(written["neuronpedia_pt"], map_location="cpu", weights_only=True)
+    assert pt_data["n_prompts"] == 4
+    assert pt_data["d_model"] == 16
+    assert pt_data["source_layers"] == [0, 1]
+    assert pt_data["J"][0].shape == (16, 16)
+    assert pt_data["J"][0].dtype == torch.float16
+    assert pt_data["provenance"]["author"] == "Test Author"
+    assert pt_data["provenance"]["hc_count"] == 4
+
+    reloaded_4b = Qwen38JacobianLens.load(written["full_4branch_safetensors"])
+    assert reloaded_4b.jacobians[0].shape == (16, 64)
+    assert torch.allclose(reloaded_4b.collapsed_jacobians()[0], pt_data["J"][0].float(), atol=1e-3)
+
+    cfg_text = Path(written["config_yaml"]).read_text(encoding="utf-8")
+    assert 'np_model_id: "qwen3.8-flash-next"' in cfg_text
+    assert "prompts_fitted: 4" in cfg_text
+    assert 'author: "Test Author"' in cfg_text
+
     engine.close()
     loaded.ple_providers[0].close()
+
+
+def test_convergence_logger_truncates_crash_tail_on_resume(tmp_path: Path):
+    csv_p = str(tmp_path / "conv.csv")
+    lg1 = ConvergenceLogger(csv_p, resume_next_idx=0)
+    for i in range(4):
+        lg1.append(i + 1, FitStats(i, 128, 112, 10.0, 1.0, 9.0, 1.2, 0.01 / (i + 1)))
+
+    # Simulate resuming from checkpoint at next_idx=2 (prompts 2 & 3 happened after last checkpoint before crash)
+    lg2 = ConvergenceLogger(csv_p, resume_next_idx=2)
+    rows = Path(csv_p).read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 3  # header + prompt 0 + prompt 1
+    assert len(lg2.tail_deltas(10)) == 2
+
