@@ -48,6 +48,20 @@ Automatically detects whichever Google Colab High-RAM runtime is randomly assign
 
 ---
 
+## Crash-Proof Zero-Stall Checkpointing
+
+Naively calling `torch.save(jacobian_sum, "/content/drive/...")` writes a **4.69 GiB** fp32 pickle zip (`~10 GB` transient Drive quota) and stalls the GPU for **80–180 s** over Google Drive FUSE every few prompts.
+
+Instead, `AsyncCheckpointManager` ([`qwen38_jlens/checkpoint.py`](./qwen38_jlens/checkpoint.py)):
+1. **Stores running mean `J_mean = jacobian_sum / n_done` in a single `.safetensors` file** with `n_done`, `next_idx`, `source_layers`, and `branch_norms` embedded in the safetensors `__metadata__` header:
+   - **`2.34 GiB` in `float16`** (2× smaller, zero fp16 overflow for any `n_prompts`; optional `float32` = `4.69 GiB`).
+   - **Immediately usable on disconnect**: any interrupted checkpoint loads directly via `Qwen38JacobianLens.load(ckpt_path)`.
+2. **Writes to local NVMe in `< 1 s`, then hardlinks and uploads asynchronously on a background thread** to **Google Drive** and/or **Hugging Face Hub** (`HF_CHECKPOINT_REPO` — free unlimited Xet storage at ~300–800 MB/s, avoiding Drive's 15 GB free quota) with **0 s GPU blocking**.
+3. **Time + count triggers + `KeyboardInterrupt` flush**: checkpoints every `N` prompts or `M` minutes, skips overlapping background uploads without piling up, and flushes cleanly if you stop the cell.
+4. **Multi-source auto-resume**: on restart, peeks Local NVMe, Google Drive, and HF Hub headers (`< 1 ms`) and resumes from whichever has the highest `next_idx`.
+
+---
+
 ## Repository Layout
 
 - [`qwen38_jlens_colab.ipynb`](./qwen38_jlens_colab.ipynb) — **100% self-contained Google Colab notebook** (click Open in Colab above or upload directly).
@@ -56,6 +70,7 @@ Automatically detects whichever Google Colab High-RAM runtime is randomly assign
 - [`qwen38_jlens/ple_mmap.py`](./qwen38_jlens/ple_mmap.py) — Zero-RAM `MmapPleTable`, exact SplitMix64 prime-vocab n-gram hasher, and `PreextractedPleProvider`.
 - [`qwen38_jlens/model_ops.py`](./qwen38_jlens/model_ops.py) — Exact `B = 1` forward + batched-cotangent analytical VJP for every `qwen4_exp` submodule.
 - [`qwen38_jlens/loader.py`](./qwen38_jlens/loader.py) — Streaming safetensors shard packer (Vision/MTP skip, split/fused FP8 expert handling, contiguous binary Tier-2 slabs, raw blob eviction).
+- [`qwen38_jlens/checkpoint.py`](./qwen38_jlens/checkpoint.py) — Zero-GPU-stall `AsyncCheckpointManager`: single-file `.safetensors` running-mean (`2.34 GiB` fp16 / `4.69 GiB` fp32), `<1 s` local NVMe write + background Google Drive / Hugging Face Hub sync, `KeyboardInterrupt` flush, and multi-source best-`next_idx` auto-resume.
 - [`qwen38_jlens/engine.py`](./qwen38_jlens/engine.py) — `AsyncMoEStreamer` (background NVMe thread + pinned host ring + CUDA copy stream + GPU staging ring) & `Qwen38JLensEngine` fitter/applier.
 - [`qwen38_jlens/lens.py`](./qwen38_jlens/lens.py) — `Qwen38JacobianLens` (`save`, `load`, `merge`, `branch_norms`, `collapsed_jacobians`) & HTML slice renderer.
 - [`build_notebook.py`](./build_notebook.py) — Rebuilds `qwen38_jlens_colab.ipynb` deterministically from `qwen38_jlens/`.

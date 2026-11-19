@@ -500,32 +500,66 @@ class Qwen38JLensEngine:
         source_layers: Sequence[int] | None = None,
         skip_first: int = SKIP_FIRST_N_POSITIONS,
         checkpoint_path: str | None = None,
-        checkpoint_every: int = 5,
+        checkpoint_every: int = 10,
+        checkpoint_manager: Any | None = None,
         resume: bool = True,
         on_prompt_done: Any = None,
     ) -> Qwen38JacobianLens:
-        """Fit `J_l` over tokenized prompts `[1, T]` with atomic checkpointing & seamless resume."""
+        """Fit `J_l` over tokenized prompts `[1, T]` with zero-GPU-stall async checkpointing & resume.
+
+        Supports either:
+          - `checkpoint_manager=AsyncCheckpointManager(...)` (recommended: local NVMe + async Drive/HF Hub,
+            count + time triggers, single-file `.safetensors`, directly loadable as a lens on interrupt!), OR
+          - `checkpoint_path=".../ckpt.safetensors"` (or legacy `.pt`) for simple local checkpointing.
+        """
+        from qwen38_jlens.checkpoint import AsyncCheckpointManager, CheckpointConfig
+
         n_layers = self.cfg.num_hidden_layers
         D = self.cfg.hidden_size
         D_hc = D * self.cfg.hc_count
         src_layers = list(range(n_layers)) if source_layers is None else sorted(set(source_layers))
 
-        if resume and checkpoint_path is not None and os.path.exists(checkpoint_path):
+        owned_mgr = False
+        mgr: AsyncCheckpointManager | None = checkpoint_manager
+        if mgr is None and checkpoint_path is not None:
+            if checkpoint_path.endswith(".safetensors"):
+                mgr = AsyncCheckpointManager(
+                    CheckpointConfig(
+                        local_path=checkpoint_path,
+                        every_n_prompts=max(1, checkpoint_every),
+                        every_minutes=0.0,
+                        ckpt_dtype="float16",
+                    )
+                )
+                owned_mgr = True
+
+        # ---- Resume from freshest checkpoint (Local / Drive / HF Hub or legacy .pt) ----
+        jacobian_sum: dict[int, torch.Tensor]
+        n_done: int
+        next_idx: int
+        resumed = None
+        if resume and mgr is not None:
+            resumed = mgr.load_best_resume(
+                expected_source_layers=src_layers, expected_skip_first=skip_first
+            )
+        elif resume and checkpoint_path is not None and os.path.exists(checkpoint_path):
             state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
             if state.get("source_layers") != src_layers or state.get("skip_first") != skip_first:
                 raise ValueError(
                     f"Checkpoint at {checkpoint_path} has incompatible source_layers/skip_first; pass resume=False."
                 )
-            jacobian_sum: dict[int, torch.Tensor] = state["jacobian_sum"]
-            n_done = int(state["n_done"])
-            next_idx = int(state["next_idx"])
-            logger.info("Resuming J-lens fit from checkpoint: %d/%d prompts processed.", next_idx, len(tokenized_prompts))
+            resumed = (state["jacobian_sum"], int(state["n_done"]), int(state["next_idx"]))
+
+        if resumed is not None:
+            jacobian_sum, n_done, next_idx = resumed
+            logger.info("Resuming J-lens fit: %d/%d prompts already processed (n_done=%d).", next_idx, len(tokenized_prompts), n_done)
         else:
             jacobian_sum = {l: torch.zeros((D, D_hc), dtype=torch.float32) for l in src_layers}
             n_done = 0
             next_idx = 0
+        resumed_next_idx = next_idx
 
-        def _save_ckpt() -> None:
+        def _save_legacy_pt() -> None:
             if checkpoint_path is None:
                 return
             parent = os.path.dirname(os.path.abspath(checkpoint_path))
@@ -547,64 +581,123 @@ class Qwen38JLensEngine:
             os.replace(tmp, checkpoint_path)
 
         sqrt_d = math.sqrt(D)
-        for p_idx, ids in enumerate(tokenized_prompts):
-            if p_idx < next_idx:
-                continue
-            t0 = time.perf_counter()
-            try:
-                per_J, seq_len, n_valid, t_fwd, t_bwd = self.jacobian_for_tokens(
-                    ids, src_layers, skip_first=skip_first
-                )
-            except ValueError as exc:
-                logger.warning("Skipping prompt %d: %s", p_idx, exc)
+        prompts_since_ckpt = 0
+        try:
+            for p_idx, ids in enumerate(tokenized_prompts):
+                if p_idx < next_idx:
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    per_J, seq_len, n_valid, t_fwd, t_bwd = self.jacobian_for_tokens(
+                        ids, src_layers, skip_first=skip_first
+                    )
+                except ValueError as exc:
+                    logger.warning("Skipping prompt %d: %s", p_idx, exc)
+                    next_idx = p_idx + 1
+                    continue
+
+                max_norm = max(per_J[l].norm().item() for l in src_layers) / sqrt_d
+                if n_done > 0:
+                    rel_change = max(
+                        (
+                            (per_J[l] - jacobian_sum[l] / n_done).norm()
+                            / ((n_done + 1) * max(1e-8, (jacobian_sum[l] / n_done).norm().item()))
+                        ).item()
+                        for l in src_layers
+                    )
+                else:
+                    rel_change = float("nan")
+
+                for l in src_layers:
+                    jacobian_sum[l].add_(per_J[l])
+                n_done += 1
                 next_idx = p_idx + 1
-                continue
+                prompts_since_ckpt += 1
+                elapsed = time.perf_counter() - t0
 
-            max_norm = max(per_J[l].norm().item() for l in src_layers) / sqrt_d
-            if n_done > 0:
-                rel_change = max(
-                    (
-                        (per_J[l] - jacobian_sum[l] / n_done).norm()
-                        / ((n_done + 1) * max(1e-8, (jacobian_sum[l] / n_done).norm().item()))
-                    ).item()
-                    for l in src_layers
+                stats = FitStats(
+                    prompt_idx=p_idx,
+                    seq_len=seq_len,
+                    n_valid=n_valid,
+                    elapsed_s=elapsed,
+                    fwd_s=t_fwd,
+                    bwd_s=t_bwd,
+                    max_norm=max_norm,
+                    mean_rel_change=rel_change,
                 )
-            else:
-                rel_change = float("nan")
+                logger.info(
+                    "Prompt %d/%d  T=%d (valid=%d)  %.2fs (fwd=%.2fs bwd=%.2fs)  max||J||/sqrt(d)=%.3f  d_mean=%.2e",
+                    p_idx + 1, len(tokenized_prompts), seq_len, n_valid,
+                    elapsed, t_fwd, t_bwd, max_norm, rel_change,
+                )
+                if on_prompt_done is not None:
+                    on_prompt_done(stats)
 
-            for l in src_layers:
-                jacobian_sum[l].add_(per_J[l])
-            n_done += 1
-            next_idx = p_idx + 1
-            elapsed = time.perf_counter() - t0
+                if mgr is not None and mgr.should_checkpoint(prompts_since_ckpt):
+                    mgr.save_async(
+                        jacobian_sum,
+                        n_done=n_done,
+                        next_idx=next_idx,
+                        skip_first=skip_first,
+                        d_model=D,
+                        hc_count=self.cfg.hc_count,
+                        wait_remote=False,
+                    )
+                    prompts_since_ckpt = 0
+                elif mgr is None and checkpoint_path is not None and checkpoint_every > 0 and prompts_since_ckpt >= checkpoint_every:
+                    _save_legacy_pt()
+                    prompts_since_ckpt = 0
 
-            stats = FitStats(
-                prompt_idx=p_idx,
-                seq_len=seq_len,
-                n_valid=n_valid,
-                elapsed_s=elapsed,
-                fwd_s=t_fwd,
-                bwd_s=t_bwd,
-                max_norm=max_norm,
-                mean_rel_change=rel_change,
-            )
-            logger.info(
-                "Prompt %d/%d  T=%d (valid=%d)  %.2fs (fwd=%.2fs bwd=%.2fs)  max||J||/sqrt(d)=%.3f  d_mean=%.2e",
-                p_idx + 1, len(tokenized_prompts), seq_len, n_valid,
-                elapsed, t_fwd, t_bwd, max_norm, rel_change,
-            )
-            if on_prompt_done is not None:
-                on_prompt_done(stats)
-            if checkpoint_path is not None and checkpoint_every > 0 and next_idx % checkpoint_every == 0:
-                _save_ckpt()
+        except KeyboardInterrupt:
+            logger.warning("KeyboardInterrupt caught at next_idx=%d (n_done=%d); flushing checkpoint safely before exit!", next_idx, n_done)
+            if mgr is not None and n_done > 0 and next_idx > resumed_next_idx:
+                mgr.save_async(
+                    jacobian_sum,
+                    n_done=n_done,
+                    next_idx=next_idx,
+                    skip_first=skip_first,
+                    d_model=D,
+                    hc_count=self.cfg.hc_count,
+                    wait_remote=True,
+                )
+            elif checkpoint_path is not None and n_done > 0 and next_idx > resumed_next_idx:
+                _save_legacy_pt()
+            if owned_mgr and mgr is not None:
+                mgr.close()
+            raise
 
-        _save_ckpt()
+        # Final checkpoint flush (wait for Drive / HF Hub upload to finish!)
+        if mgr is not None and n_done > 0:
+            mgr.flush()
+            if next_idx > resumed_next_idx:
+                needs_final = (
+                    prompts_since_ckpt > 0
+                    or mgr._last_local_next_idx < next_idx
+                    or (mgr.has_remote and mgr._last_synced_next_idx < next_idx)
+                )
+                if needs_final:
+                    mgr.save_async(
+                        jacobian_sum,
+                        n_done=n_done,
+                        next_idx=next_idx,
+                        skip_first=skip_first,
+                        d_model=D,
+                        hc_count=self.cfg.hc_count,
+                        wait_remote=True,
+                    )
+            if owned_mgr:
+                mgr.close()
+        elif checkpoint_path is not None and n_done > 0 and next_idx > resumed_next_idx:
+            _save_legacy_pt()
+
         if n_done == 0:
             raise ValueError("No prompts were long enough to fit the Jacobian lens.")
 
-        j_mean = {l: jacobian_sum[l] / n_done for l in src_layers}
+        # Divide in-place to avoid allocating a duplicate 4.69 GiB fp32 dict on tight-RAM hosts!
+        for l in src_layers:
+            jacobian_sum[l].div_(float(n_done))
         return Qwen38JacobianLens(
-            jacobians=j_mean,
+            jacobians=jacobian_sum,
             n_prompts=n_done,
             d_model=D,
             hc_count=self.cfg.hc_count,

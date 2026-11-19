@@ -78,7 +78,24 @@ class Qwen38JacobianLens:
         return F.linear(H_l.float(), J)
 
     def save(self, path: str, *, dtype: torch.dtype = torch.float16, include_collapsed: bool = True) -> None:
-        """Atomically save fitted lens (fp16 by default, matching `anthropics/jacobian-lens`)."""
+        """Atomically save fitted lens to `.safetensors` (recommended, fast, zero-pickle) or `.pt`."""
+        if path.endswith(".safetensors"):
+            from qwen38_jlens.checkpoint import save_jlens_safetensors
+
+            save_jlens_safetensors(
+                path,
+                self.jacobians,
+                n_done=self.n_prompts,
+                next_idx=self.n_prompts,
+                skip_first=16,
+                d_model=self.d_model,
+                hc_count=self.hc_count,
+                model_name=self.model_name,
+                dtype=dtype,
+                include_collapsed=include_collapsed,
+            )
+            return
+
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -100,6 +117,19 @@ class Qwen38JacobianLens:
 
     @classmethod
     def load(cls, path: str) -> "Qwen38JacobianLens":
+        """Load a saved lens or ANY in-progress `.safetensors` checkpoint directly as a usable lens!"""
+        if path.endswith(".safetensors"):
+            from qwen38_jlens.checkpoint import load_jlens_safetensors
+
+            jacobians, meta = load_jlens_safetensors(path)
+            return cls(
+                jacobians=jacobians,
+                n_prompts=meta["n_done"],
+                d_model=meta["d_model"],
+                hc_count=meta["hc_count"],
+                model_name=meta["model_name"],
+            )
+
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
         if "J" not in ckpt:
             raise ValueError(f"{path} is not a saved Qwen38JacobianLens file (keys={sorted(ckpt)})")

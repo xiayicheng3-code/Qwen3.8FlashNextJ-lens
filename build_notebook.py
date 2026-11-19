@@ -129,33 +129,47 @@ print("Setup complete!")
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 2: User Configuration & Optional Google Drive Persistence
+    # Cell 2: User Configuration & Multi-Tier Checkpoint Persistence
     # ------------------------------------------------------------------ #
     cells.append(
-        new_markdown_cell("## 2. Fitting Configuration & Checkpoint Persistence")
+        new_markdown_cell(
+            """## 2. Fitting Configuration & Crash-Proof Async Checkpointing
+Checkpoints are stored as a **single `.safetensors` file** holding the running mean `J_mean = jacobian_sum / n_done` (plus `n_done`, `next_idx`, and layer metadata in the safetensors header):
+- **2× smaller (`2.34 GiB` in `float16` vs `4.69 GiB` in `float32`)** with zero fp16 overflow risk for any `n_prompts`.
+- **Zero GPU stalls**: writes to local NVMe in `< 1 s`, then syncs asynchronously on a background thread to **Google Drive** and/or **Hugging Face Hub** (recommended — free unlimited LFS/Xet storage at ~300–800 MB/s, avoiding Google Drive's 15 GB free quota!).
+- **Immediately usable on disconnect**: any interrupted checkpoint can be loaded directly as a valid `Qwen38JacobianLens`, and re-running automatically resumes from whichever copy (Local / Drive / HF Hub) has the highest `next_idx`."""
+        )
     )
     cells.append(
         new_code_cell(
-            """#@title Qwen3.8-Flash-Next J-Lens Configuration { display-mode: "form" }
+            """#@title Qwen3.8-Flash-Next J-Lens & Checkpoint Configuration { display-mode: "form" }
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next-FP8"  #@param {type:"string"}
-N_PROMPTS = 100          #@param {type:"integer"}  # 100 = usable lens (paper §9.3); 1000 = full paper lens
-PROMPT_OFFSET = 0        #@param {type:"integer"}  # Shift start index to shard across parallel Colab sessions & merge()
-MAX_SEQ_LEN = 128        #@param {type:"integer"}  # Paper default: 128 tokens (keeps full K=2560 in 1 sweep!)
-SKIP_FIRST = 16          #@param {type:"integer"}  # Exclude attention-sink prefix tokens (paper default: 16)
-LAYER_STRIDE = 1         #@param {type:"integer"}  # 1 = all 48 layers (0..47); 2 = every 2nd layer
-CHECKPOINT_EVERY = 5     #@param {type:"integer"}  # Atomic checkpoint cadence (prompts)
-PLE_MODE = "auto"        #@param ["auto", "mmap", "preextract"]
-MOUNT_GOOGLE_DRIVE = True #@param {type:"boolean"}
+N_PROMPTS = 100              #@param {type:"integer"}  # 100 = usable lens (paper §9.3); 1000 = full paper lens
+PROMPT_OFFSET = 0            #@param {type:"integer"}  # Shift start index to shard across parallel Colab sessions & merge()
+MAX_SEQ_LEN = 128            #@param {type:"integer"}  # Paper default: 128 tokens (keeps full K=2560 in 1 sweep!)
+SKIP_FIRST = 16              #@param {type:"integer"}  # Exclude attention-sink prefix tokens (paper default: 16)
+LAYER_STRIDE = 1             #@param {type:"integer"}  # 1 = all 48 layers (0..47); 2 = every 2nd layer
+PLE_MODE = "auto"            #@param ["auto", "mmap", "preextract"]
+
+#@markdown ### Async Checkpointing (Zero GPU Stall)
+CKPT_DTYPE = "float16"       #@param ["float16", "float32"]  # float16 = 2.34 GiB (recommended); float32 = 4.69 GiB exact
+CHECKPOINT_EVERY_PROMPTS = 10 #@param {type:"integer"}        # Trigger checkpoint every N prompts
+CHECKPOINT_EVERY_MINUTES = 10.0 #@param {type:"number"}       # OR every M minutes (whichever comes first)
+SAVE_TO_GOOGLE_DRIVE = True  #@param {type:"boolean"}         # Async mirror to Google Drive (only 2.34 GiB in fp16!)
 DRIVE_OUT_DIR = "/content/drive/MyDrive/qwen38_jlens_out" #@param {type:"string"}
-LOCAL_WORK_DIR = "/content/qwen38_work"  #@param {type:"string"}
-HF_TOKEN = ""            #@param {type:"string"}
+HF_CHECKPOINT_REPO = ""      #@param {type:"string"}          # Optional e.g. "your-name/qwen38-jlens-ckpt" (unlimited storage, fastest!)
+HF_REPO_PRIVATE = True       #@param {type:"boolean"}
+ALSO_SAVE_LEGACY_PT = False  #@param {type:"boolean"}         # Also write `.pt` alongside `.safetensors` (doubles disk/Drive size)
+LOCAL_WORK_DIR = "/content/qwen38_work" #@param {type:"string"}
+HF_TOKEN = ""                #@param {type:"string"}
 
 import os
 os.makedirs(LOCAL_WORK_DIR, exist_ok=True)
 SLAB_DIR = os.path.join(LOCAL_WORK_DIR, "moe_slabs")
 PLE_DIR = os.path.join(LOCAL_WORK_DIR, "ple_shards")
-os.makedirs(SLAB_DIR, exist_ok=True)
-os.makedirs(PLE_DIR, exist_ok=True)
+LOCAL_CKPT_DIR = os.path.join(LOCAL_WORK_DIR, "checkpoints")
+for _d in (SLAB_DIR, PLE_DIR, LOCAL_CKPT_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 # Resolve optional HF_TOKEN from Colab Secrets if not pasted directly
 if not HF_TOKEN:
@@ -165,32 +179,39 @@ if not HF_TOKEN:
     except Exception:
         HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_TOKEN = HF_TOKEN or None
+HF_CHECKPOINT_REPO = HF_CHECKPOINT_REPO.strip() or None
 
-if MOUNT_GOOGLE_DRIVE:
+DRIVE_ENABLED = False
+if SAVE_TO_GOOGLE_DRIVE:
     try:
         from google.colab import drive
         drive.mount("/content/drive", force_remount=False)
-        OUT_DIR = DRIVE_OUT_DIR
+        os.makedirs(DRIVE_OUT_DIR, exist_ok=True)
+        DRIVE_ENABLED = True
     except Exception as exc:
-        print(f"Google Drive mount unavailable ({exc}); saving outputs to {LOCAL_WORK_DIR}")
-        OUT_DIR = LOCAL_WORK_DIR
-else:
-    OUT_DIR = LOCAL_WORK_DIR
+        print(f"Google Drive mount unavailable ({exc}); using local NVMe (+ HF Hub if configured).")
 
-os.makedirs(OUT_DIR, exist_ok=True)
 TAG = f"off{PROMPT_OFFSET}_n{N_PROMPTS}_s{LAYER_STRIDE}"
-CKPT_PATH = os.path.join(OUT_DIR, f"qwen38_jlens_ckpt_{TAG}.pt")
-LENS_PATH = os.path.join(OUT_DIR, f"qwen38_flash_next_jlens_{TAG}.pt")
+CKPT_FILENAME = f"qwen38_jlens_ckpt_{TAG}.safetensors"
+LENS_FILENAME = f"qwen38_flash_next_jlens_{TAG}.safetensors"
 
-print(f"Outputs & checkpoints -> {OUT_DIR}")
-print(f"  Checkpoint : {CKPT_PATH}")
-print(f"  Final Lens : {LENS_PATH}")
+LOCAL_CKPT_PATH = os.path.join(LOCAL_CKPT_DIR, CKPT_FILENAME)
+DRIVE_CKPT_PATH = os.path.join(DRIVE_OUT_DIR, CKPT_FILENAME) if DRIVE_ENABLED else None
+FINAL_LENS_LOCAL = os.path.join(LOCAL_CKPT_DIR, LENS_FILENAME)
+FINAL_LENS_DRIVE = os.path.join(DRIVE_OUT_DIR, LENS_FILENAME) if DRIVE_ENABLED else None
+OUT_DIR = DRIVE_OUT_DIR if DRIVE_ENABLED else LOCAL_CKPT_DIR
+
+print("Checkpoint Destinations:")
+print(f"  Local NVMe (fast <1s) : {LOCAL_CKPT_PATH}")
+print(f"  Google Drive (async)  : {DRIVE_CKPT_PATH or 'disabled'}")
+print(f"  HF Hub (async Xet)    : {f'{HF_CHECKPOINT_REPO}/{CKPT_FILENAME}' if HF_CHECKPOINT_REPO else 'disabled'}")
+print(f"  Cadence & Dtype       : every {CHECKPOINT_EVERY_PROMPTS} prompts or {CHECKPOINT_EVERY_MINUTES} min | {CKPT_DTYPE}")
 """
         )
     )
 
     # ------------------------------------------------------------------ #
-    # Cells 3..9: Self-Contained Verified Engine Modules
+    # Cells 3..10: Self-Contained Verified Engine Modules
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
@@ -206,18 +227,18 @@ Writing the verified, modular engine directly into `/content/qwen38_jlens/` so t
         ("kernels.py", "GPU Kernels: FlashQLA (SM120/90), FLA (SM80), Triton FP8 Block-128 Dequant & SwiGLU VJP, grouped_mm"),
         ("model_ops.py", "Exact Qwen3.8-Flash-Next (qwen4_exp) Forward & Batched-Cotangent Analytical VJP Operators"),
         ("loader.py", "Streaming Shard-by-Shard Safetensors Packer & 3-Tier MoE Slab Manager"),
+        ("checkpoint.py", "Crash-Proof Zero-GPU-Stall Async Checkpointer (Safetensors + Google Drive + HF Hub)"),
         ("lens.py", "Qwen38JacobianLens Container, 4-Branch Diagnostics & Interactive Slice Renderer"),
         ("engine.py", "Async Double-Buffered 3-Tier MoE Streamer & Single-Sweep Layer-by-Layer J-Lens Engine"),
         ("__init__.py", "Package Exports"),
     ]
     for mod_name, title in module_order:
         code = _read_module(mod_name)
-        # Validate Python syntax of every module before embedding
         ast.parse(code, filename=mod_name)
         cells.append(new_code_cell(f"%%writefile qwen38_jlens/{mod_name}\n{code}"))
 
     # ------------------------------------------------------------------ #
-    # Cell 10: Live Hardware Probe, Concrete Offload Plan & Kernel Micro-Benchmark
+    # Cell 11: Live Hardware Probe, Concrete Offload Plan & Kernel Micro-Benchmark
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell("## 4. Live Hardware Auto-Detection, Concrete Offload Plan & Kernel Micro-Benchmark")
@@ -262,7 +283,6 @@ tier_sym = {
     StorageTier.HOST_PAGEABLE: "R",
     StorageTier.NVME_SLAB: "D",
 }
-tier_map_str = " ".join(f"{l:02d}:{tier_sym[plan.layer_tiers[l]]}" for l in range(48))
 print("\\nInterleaved Layer Placement Map (G=GPU HBM, P=Pinned RAM, R=Pageable RAM, D=NVMe Slab):")
 for row_start in range(0, 48, 12):
     print("  " + " ".join(f"L{l:02d}:{tier_sym[plan.layer_tiers[l]]}" for l in range(row_start, row_start + 12)))
@@ -273,7 +293,6 @@ gdn_bench = GatedDeltaRuleBackend(preferred=plan.gdn_backend, verify_on_init=Tru
 print(f"  [OK] Active GDN kernel : {gdn_bench.name} (direct={gdn_bench._use_direct})")
 
 dev = torch.device("cuda:0")
-# 1) Benchmark Triton 128x128 FP8 block dequant (380 active experts ~ 1 typical prompt layer)
 E_act = min(380, plan.expert_dequant_chunk)
 w_fp8 = torch.randn(E_act, 1280, 2560, device=dev).to(torch.float8_e4m3fn)
 s_fp32 = torch.ones(E_act, 10, 20, device=dev, dtype=torch.float32) * 0.05
@@ -287,7 +306,6 @@ dt_deq = (time.perf_counter() - t0) / 5
 bytes_rw = E_act * 1280 * 2560 * (1 + 2)
 print(f"  [OK] Triton FP8->BF16 dequant ({E_act} experts): {dt_deq*1e3:.2f} ms ({bytes_rw / dt_deq / 1e9:.0f} GB/s)")
 
-# 2) Benchmark CUTLASS/cuBLAS grouped_mm backward GEMM (gate_up_proj VJP at K_blk = moe_k_chunk)
 K_blk = plan.moe_k_chunk
 S_rows = 128 * 10
 counts = torch.full((E_act,), max(1, S_rows // E_act), device=dev, dtype=torch.int32)
@@ -311,7 +329,7 @@ torch.cuda.empty_cache()
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 11: Load Tokenizer & Fitting Corpus (WikiText-103)
+    # Cell 12: Load Tokenizer & Fitting Corpus (WikiText-103)
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
@@ -352,7 +370,6 @@ def load_wikitext_slice(offset: int, n_prompts: int, min_chars: int = 600) -> li
 raw_prompts = load_wikitext_slice(PROMPT_OFFSET, N_PROMPTS)
 tokenized_prompts = [encode_prompt(p, MAX_SEQ_LEN) for p in raw_prompts]
 
-# Also tokenize evaluation prompts up front (needed if tight-disk `ple_mode='preextract'` triggers)
 EVAL_PROMPTS = [
     "Fact: The currency used in the country shaped like a boot is",
     "The capital of the country where Mount Everest is located is",
@@ -368,7 +385,7 @@ print(f"Prepared {len(tokenized_prompts)} WikiText prompts (offset={PROMPT_OFFSE
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 12: Streaming Shard-by-Shard 3-Tier Model Loader
+    # Cell 13: Streaming Shard-by-Shard 3-Tier Model Loader
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
@@ -408,18 +425,42 @@ print(f"  Live Telemetry    : VRAM alloc={vram_used:.1f} GiB | RAM used={ram_use
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 13: Run Single-Sweep Layer-by-Layer J-Lens Fitting
+    # Cell 14: Run Single-Sweep Layer-by-Layer J-Lens Fitting w/ Async Checkpointer
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
-            """## 7. Fit Qwen3.8-Flash-Next Jacobian Lens (`J_l ∈ R^{2560 × 10240}`)
-Runs our single-sweep layer-by-layer reverse propagator with live convergence telemetry and atomic checkpointing (`CKPT_PATH`). If Colab disconnects, simply re-run Cells 1–7 and fitting resumes seamlessly from the last checkpoint!"""
+            """## 7. Fit Qwen3.8-Flash-Next Jacobian Lens (`J_l ∈ R^{2560 × 10240}`) with Zero-Stall Async Checkpointing
+- Saves `J_mean` as a single `.safetensors` file (`2.34 GiB` in `fp16`) to local NVMe in `< 1 s`, then syncs in the background to Google Drive and/or Hugging Face Hub with **0 s GPU stall**.
+- Interrupting the cell (`Stop` / `KeyboardInterrupt`) cleanly flushes the latest checkpoint before exiting.
+- Re-running after any Colab disconnect automatically resumes from whichever target (Local / Drive / HF Hub) has the highest `next_idx`!"""
         )
     )
     cells.append(
         new_code_cell(
-            """import time, torch
+            """import os, shutil, time, torch
 from tqdm.auto import tqdm
+from qwen38_jlens import AsyncCheckpointManager, CheckpointConfig, peek_checkpoint_metadata
+
+ckpt_mgr = AsyncCheckpointManager(
+    CheckpointConfig(
+        local_path=LOCAL_CKPT_PATH,
+        drive_path=DRIVE_CKPT_PATH,
+        hf_repo_id=HF_CHECKPOINT_REPO,
+        hf_path_in_repo=CKPT_FILENAME,
+        hf_token=HF_TOKEN,
+        hf_private=HF_REPO_PRIVATE,
+        ckpt_dtype=CKPT_DTYPE,
+        every_n_prompts=CHECKPOINT_EVERY_PROMPTS,
+        every_minutes=CHECKPOINT_EVERY_MINUTES,
+        model_name=MODEL_ID,
+    )
+)
+
+# Quick preview of existing checkpoints before starting
+for lbl, p in (("Local NVMe", LOCAL_CKPT_PATH), ("Google Drive", DRIVE_CKPT_PATH)):
+    meta = peek_checkpoint_metadata(p) if p else None
+    if meta:
+        print(f"Found existing {lbl} checkpoint: next_idx={meta['next_idx']}, n_done={meta['n_done']} ({meta['ckpt_dtype']})")
 
 pbar = tqdm(total=len(tokenized_prompts), desc="Fitting Qwen3.8 J-Lens", unit="prompt")
 times = []
@@ -435,28 +476,59 @@ def _on_prompt(stats):
         bwd=f"{stats.bwd_s:.1f}s",
         avg=f"{avg_s:.1f}s/p",
         d_mean=f"{stats.mean_rel_change:.1e}",
-        vram_pk=f"{vram_pk:.1f}G",
+        vram=f"{vram_pk:.1f}G",
+        ckpt=ckpt_mgr.last_status,
     )
     pbar.refresh()
 
 torch.cuda.reset_peak_memory_stats()
 t_fit = time.perf_counter()
 
-lens = engine.fit(
-    tokenized_prompts,
-    source_layers=SOURCE_LAYERS,
-    skip_first=SKIP_FIRST,
-    checkpoint_path=CKPT_PATH,
-    checkpoint_every=CHECKPOINT_EVERY,
-    resume=True,
-    on_prompt_done=_on_prompt,
-)
-pbar.close()
+try:
+    lens = engine.fit(
+        tokenized_prompts,
+        source_layers=SOURCE_LAYERS,
+        skip_first=SKIP_FIRST,
+        checkpoint_manager=ckpt_mgr,
+        resume=True,
+        on_prompt_done=_on_prompt,
+    )
+finally:
+    pbar.close()
+    ckpt_mgr.close()
 
-lens.save(LENS_PATH, dtype=torch.float16, include_collapsed=True)
+# Save final lens (.safetensors with collapsed J included; optional legacy .pt)
+lens.save(FINAL_LENS_LOCAL, dtype=torch.float16, include_collapsed=True)
+if FINAL_LENS_DRIVE:
+    shutil.copyfile(FINAL_LENS_LOCAL, FINAL_LENS_DRIVE + ".tmp")
+    os.replace(FINAL_LENS_DRIVE + ".tmp", FINAL_LENS_DRIVE)
+
+if ALSO_SAVE_LEGACY_PT:
+    pt_path = os.path.join(OUT_DIR, f"qwen38_flash_next_jlens_{TAG}.pt")
+    lens.save(pt_path, dtype=torch.float16, include_collapsed=True)
+    print(f"Saved legacy .pt lens: {pt_path}")
+
+if HF_CHECKPOINT_REPO:
+    from huggingface_hub import HfApi
+    _hf_api = HfApi(token=HF_TOKEN)
+    _hf_api.create_repo(
+        repo_id=HF_CHECKPOINT_REPO,
+        repo_type="model",
+        private=HF_REPO_PRIVATE,
+        exist_ok=True,
+    )
+    _hf_api.upload_file(
+        path_or_fileobj=FINAL_LENS_LOCAL,
+        path_in_repo=LENS_FILENAME,
+        repo_id=HF_CHECKPOINT_REPO,
+        repo_type="model",
+        commit_message=f"Final Qwen3.8-Flash-Next J-lens (n={lens.n_prompts})",
+    )
+    print(f"Uploaded final lens to HF Hub: {HF_CHECKPOINT_REPO}/{LENS_FILENAME}")
+
 total_min = (time.perf_counter() - t_fit) / 60.0
 peak_vram = torch.cuda.max_memory_allocated() / 1024**3
-print(f"\\nSaved fitted lens: {LENS_PATH}")
+print(f"\\nSaved final lens: {FINAL_LENS_DRIVE or FINAL_LENS_LOCAL}")
 print(f"  Summary   : {lens}")
 print(f"  Total time: {total_min:.2f} min ({(total_min*60)/max(1, len(times)):.2f} s/prompt)")
 print(f"  Peak VRAM : {peak_vram:.2f} GiB")
@@ -465,7 +537,7 @@ print(f"  Peak VRAM : {peak_vram:.2f} GiB")
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 14: Verify Fitted J-Lens vs Logit-Lens + 4-Branch Diagnostics + Slice HTML
+    # Cell 15: Verify Fitted J-Lens vs Logit-Lens + 4-Branch Diagnostics + Slice HTML
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
@@ -526,24 +598,25 @@ display(HTML(render_slice_html(tok_strs, layer_top1, model_top1, title=f"Qwen3.8
     )
 
     # ------------------------------------------------------------------ #
-    # Cell 15: Multi-Session Sharded Merge & Optional HF Hub Upload
+    # Cell 16: Multi-Session Sharded Merge & Loading Interrupted Checkpoints
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
-            """## 9. (Optional) Merge Parallel Colab Shards (`n = 1000`) & Upload to Hugging Face Hub
-Run multiple Colab sessions with `PROMPT_OFFSET = 0, 100, 200, ...` saving to the same Google Drive folder, then merge them with exact `n_prompts`-weighting via `Qwen38JacobianLens.merge(...)`."""
+            """## 9. (Optional) Merge Parallel Colab Shards (`n = 1000`) or Use an Interrupted Checkpoint Directly
+- Because checkpoints store `J_mean` + `n_done` in `.safetensors`, **any interrupted checkpoint** can be loaded directly via `Qwen38JacobianLens.load(ckpt_path)`.
+- Run multiple Colab sessions with `PROMPT_OFFSET = 0, 100, 200, ...` pointing to the same Drive folder or HF Hub repo, then merge them into one exact `n_prompts`-weighted lens."""
         )
     )
     cells.append(
         new_code_cell(
-            """# Uncomment to merge multiple sharded lens files into one combined lens:
+            """# Uncomment to merge multiple sharded `.safetensors` lenses (or interrupted checkpoints!):
 # import glob
 # from qwen38_jlens import Qwen38JacobianLens
-# shard_files = sorted(glob.glob(f"{OUT_DIR}/qwen38_flash_next_jlens_off*.pt"))
+# shard_files = sorted(glob.glob(f"{OUT_DIR}/qwen38_flash_next_jlens_off*.safetensors"))
 # print("Merging:", shard_files)
 # merged = Qwen38JacobianLens.merge([Qwen38JacobianLens.load(p) for p in shard_files])
-# merged_path = f"{OUT_DIR}/qwen38_flash_next_jlens_merged_n{merged.n_prompts}.pt"
-# merged.save(merged_path)
+# merged_path = f"{OUT_DIR}/qwen38_flash_next_jlens_merged_n{merged.n_prompts}.safetensors"
+# merged.save(merged_path, include_collapsed=True)
 # print("Saved merged lens:", merged_path, merged)
 
 # Optional cleanup of temporary local NVMe slabs / PLE shards:
