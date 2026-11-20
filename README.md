@@ -15,9 +15,10 @@ Automatically detects whichever Google Colab High-RAM runtime is randomly assign
    - Computing $J_\ell = \mathbb{E}[\partial h_{\text{final}} / \partial H_\ell] \in \mathbb{R}^{2560 \times 10240}$ via reverse-mode VJP requires the **exact same `K = 2560` output cotangents** as a single-stream model while capturing all 4 branches (plus free `J_collapsed = sum_b J_l[:, b, :]` and per-branch norms).
    - Optionally includes **embedding layer `-1`** (`INCLUDE_EMBEDDING_LAYER = True` by default in the notebook, +2.1% runtime), whose 4-branch sum $J_{\text{collapsed}}[-1] = \sum_{b=0}^{3} J_{-1}[:, b, :]$ equals the exact token-embedding Jacobian $\mathbb{E}[\partial h_{\text{final}} / \partial \mathrm{emb}] \in \mathbb{R}^{2560 \times 2560}$ (stored as `J.embed` in `.safetensors` and `J[-1]` in `.pt`).
 
-2. **Single-Sweep Layer-by-Layer Reverse Propagation (40×–120× Less PCIe/NVMe Traffic)**:
+2. **Single-Sweep Layer-by-Layer Reverse Propagation + 16-Aligned Causal Suffix Pruning (40×–120× Less PCIe/NVMe Traffic)**:
    - Naive `anthropics/jacobian-lens` (`dim_batch = 8`) runs 320 backward passes through all 48 layers per prompt -> `320 × 112.5 GiB = 36 TB` over PCIe/prompt (~24 min/prompt).
-   - Our engine runs ONE `B = 1` forward pass saving only layer inputs (`~120 MB` total), then holds all **`K = 2560` cotangents** in a single in-place GPU buffer (`6.25 GiB` at `T = 128`) and finishes ALL 2560 VJPs of layer $\ell$ **before** moving to layer $\ell - 1$ -> **1× weight sweep per prompt**!
+   - Our engine runs ONE `B = 1` forward pass on full `[0:T]` saving only layer inputs (`~120 MB` total), then exploits strict block lower-triangular causality to prune the masked attention-sink prefix (`[0 : bwd_start]`, `T_v = 112` at `T = 128, skip_first = 16`) from the entire backward sweep!
+   - Holds all **`K = 2560` cotangents** in ONE in-place GPU buffer (`5.47 GiB` vs `6.25 GiB`, freeing `+0.78 GiB` VRAM headroom and cutting `12.5%` MoE/projection/QSA backward FLOPs while keeping **128-wide** tiling on MoE `grouped_mm`, dense projections, and FlashQLA/FLA, and **16-wide** Tensor Core/TMA alignment on QSA `bmm`), finishing ALL 2560 VJPs of layer $\ell$ **before** moving to layer $\ell - 1$ -> **1× weight sweep per prompt**!
 
 3. **Fused Active-Expert MoE VJP (`grouped_mm` + Custom Triton Kernels)**:
    - Dequantizes **only hit experts** (`E_hit ≤ 512`) **ONCE** per layer via a single-pass **Triton 128×128 FP8 block dequantizer** (~2.5 ms, zero temp allocations).

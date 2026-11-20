@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from qwen38_jlens.engine import Qwen38JLensEngine, valid_position_mask
+from qwen38_jlens.engine import Qwen38JLensEngine, compute_aligned_bwd_start, valid_position_mask
 from qwen38_jlens.hardware import HardwareProfile, StorageTier, build_offload_plan
 from qwen38_jlens.kernels import GatedDeltaRuleBackend, dequantize_fp8_blockwise, torch_chunk_gated_delta_rule
 from qwen38_jlens.loader import LoadedQwen38Model, Qwen38TextConfig
@@ -32,6 +32,7 @@ from qwen38_jlens.model_ops import (
     MoeExpertPayload,
     PleLayerWeights,
     QsaLayerWeights,
+    _slice_ple_saved,
     apply_partial_rope,
     build_rope_cos_sin,
     decoder_layer_fwd,
@@ -391,15 +392,117 @@ def test_sparse_moe_fp8_vjp_parity(dequant_chunk_size: int):
     assert torch.allclose(dx_fast, dx_ref, atol=1e-4)
 
 
+def test_compute_aligned_bwd_start():
+    assert compute_aligned_bwd_start(128, 16, align=16) == 16  # T_v = 112 (16-aligned!)
+    assert compute_aligned_bwd_start(128, 32, align=16) == 32  # T_v = 96
+    assert compute_aligned_bwd_start(128, 20, align=16) == 16  # T_v = 112 (rounds up so <= skip_first)
+    assert compute_aligned_bwd_start(128, 10, align=16) == 0   # T_v = 128
+    assert compute_aligned_bwd_start(100, 16, align=16) == 4   # T_v = 96 (16-aligned, <= skip_first)
+    assert compute_aligned_bwd_start(48, 16, align=16) == 16   # T_v = 32
+    assert compute_aligned_bwd_start(128, 0, align=16) == 0
+    assert compute_aligned_bwd_start(128, 16, align=0) == 0    # explicit disable
+    assert compute_aligned_bwd_start(128, 20, align=1) == 20   # unaligned exact skip_first
+
+
+def test_suffix_vjp_exact_parity():
+    """Verify causal suffix-only VJP (`bwd_start > 0`) matches full autograd for QSA (L2 & SDPA), GDN, and PLE."""
+    torch.manual_seed(7)
+    T, s = 32, 16  # T_v = 16
+    D, Hq, Hkv, Dh, K = 32, 6, 2, 16, 9
+
+    # 1. QSA suffix VJP (both l2_cached AND sdpa fallback paths!)
+    w_qsa = QsaLayerWeights(
+        q_proj=torch.randn(Hq * Dh * 2, D) * 0.1,
+        k_proj=torch.randn(Hkv * Dh, D) * 0.1,
+        v_proj=torch.randn(Hkv * Dh, D) * 0.1,
+        o_proj=torch.randn(D, Hq * Dh) * 0.1,
+        q_norm=torch.randn(Dh) * 0.1,
+        k_norm=torch.randn(Dh) * 0.1,
+        num_q_heads=Hq,
+        num_kv_heads=Hkv,
+        head_dim=Dh,
+    )
+    cos, sin = build_rope_cos_sin(T, Dh, 0.25, 10_000.0, torch.device("cpu"), torch.float32)
+    x_qsa = torch.randn(1, T, D)
+    dy_full = torch.zeros(K, T, D)
+    dy_full[:, s:, :] = torch.randn(K, T - s, D)
+
+    _, saved_qsa = qsa_layer_fwd(x_qsa, w_qsa, cos, sin)
+    dx_qsa_l2 = qsa_layer_vjp(dy_full[:, s:, :], w_qsa, saved_qsa, bwd_start=s)
+    saved_qsa_sdpa = dict(saved_qsa, attn_mode="sdpa")
+    dx_qsa_sdpa = qsa_layer_vjp(dy_full[:, s:, :], w_qsa, saved_qsa_sdpa, bwd_start=s)
+
+    x_r = x_qsa.expand(K, -1, -1).clone().requires_grad_(True)
+    (dx_qsa_ref,) = torch.autograd.grad(_ref_qsa(x_r, w_qsa, cos, sin), x_r, grad_outputs=dy_full)
+    assert torch.allclose(dx_qsa_l2, dx_qsa_ref[:, s:, :], atol=1e-5)
+    assert torch.allclose(dx_qsa_sdpa, dx_qsa_ref[:, s:, :], atol=1e-5)
+
+    # 2. GDN suffix VJP
+    Hk, Hv, Dk, Dv = 2, 6, 8, 8
+    kd, vd = Hk * Dk, Hv * Dv
+    cd = 2 * kd + vd
+    w_gdn = GdnLayerWeights(
+        in_proj_qkv=torch.randn(cd, D) * 0.1,
+        in_proj_z=torch.randn(vd, D) * 0.1,
+        in_proj_b=torch.randn(Hv, D) * 0.1,
+        in_proj_a=torch.randn(Hv, D) * 0.1,
+        conv1d_weight=torch.randn(cd, 4) * 0.2,
+        dt_bias=torch.ones(Hv) * 0.5,
+        A_log=torch.randn(Hv) * 0.3,
+        norm_weight=torch.ones(Dv) + torch.randn(Dv) * 0.1,
+        out_proj=torch.randn(D, vd) * 0.1,
+        num_k_heads=Hk,
+        num_v_heads=Hv,
+        head_k_dim=Dk,
+        head_v_dim=Dv,
+        output_gate_type="sigmoid",
+    )
+    backend = GatedDeltaRuleBackend(preferred="torch")
+    x_gdn = torch.randn(1, T, D)
+    _, saved_gdn = gdn_layer_fwd(x_gdn, w_gdn, backend)
+    dx_gdn_s = gdn_layer_vjp(dy_full[:, s:, :], w_gdn, saved_gdn, backend, bwd_start=s)
+
+    xg_r = x_gdn.expand(K, -1, -1).clone().requires_grad_(True)
+    (dx_gdn_ref,) = torch.autograd.grad(_ref_gdn(xg_r, w_gdn), xg_r, grad_outputs=dy_full)
+    assert torch.allclose(dx_gdn_s, dx_gdn_ref[:, s:, :], atol=1e-4)
+
+    # 3. PLE suffix VJP (dilated causal conv1d crossing bwd_start boundary!)
+    hc, D_ple = 4, 16
+    w_ple = PleLayerWeights(
+        key_proj=torch.randn(hc * D_ple, D_ple) * 0.1,
+        value_proj=torch.randn(D_ple, D_ple) * 0.1,
+        norm_key=torch.randn(hc * D_ple) * 0.1,
+        norm_query=torch.randn(hc * D_ple) * 0.1,
+        norm_conv=torch.randn(hc * D_ple) * 0.1,
+        conv1d_weight=torch.randn(hc * D_ple, 1, 4) * 0.2,
+        hc_count=hc,
+        hidden_size=D_ple,
+        ngram_size=3,
+    )
+    h_ple = torch.randn(1, T, hc * D_ple)
+    emb_ple = torch.randn(1, T, D_ple)
+    dy_ple = torch.zeros(K, T, hc * D_ple)
+    dy_ple[:, s:, :] = torch.randn(K, T - s, hc * D_ple)
+
+    _, saved_ple = ple_layer_fwd(h_ple, emb_ple, w_ple)
+    dh_ple_s = ple_layer_vjp(dy_ple[:, s:, :], w_ple, _slice_ple_saved(saved_ple, s))
+
+    hp_r = h_ple.expand(K, -1, -1).clone().requires_grad_(True)
+    (dh_ple_ref,) = torch.autograd.grad(_ref_ple(hp_r, emb_ple.expand(K, -1, -1), w_ple), hp_r, grad_outputs=dy_ple)
+    assert torch.allclose(dh_ple_s, dh_ple_ref[:, s:, :], atol=1e-4)
+
+
 def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     """End-to-end test: 4 layers [GDN, GDN+PLE, GDN, QSA] + hyper_connection_mixer + J-lens fit.
 
-    Verifies our single-sweep layer-by-layer engine produces the EXACT same `[D, 4*D]`
-    Jacobians as Anthropic's `jlens` estimator differentiated through reference PyTorch!
+    Verifies our single-sweep layer-by-layer engine with 16-aligned causal suffix pruning
+    (`T=48, skip_first=16 -> bwd_start=16, T_v=32`) produces the EXACT same `[D, 4*D]`
+    Jacobians as BOTH `bwd_align=0` (full `[0:T]`) AND Anthropic's `jlens` estimator via autograd!
     """
     torch.manual_seed(42)
-    D, hc, E, top_k, inter, T, V = 16, 4, 8, 2, 16, 24, 128
-    skip_first = 4
+    D, hc, E, top_k, inter, T, V = 16, 4, 8, 2, 16, 48, 128
+    skip_first = 16
+    assert compute_aligned_bwd_start(T, skip_first, align=16) == 16
     cfg = Qwen38TextConfig(
         vocab_size=V,
         hidden_size=D,
@@ -513,9 +616,14 @@ def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     engine = Qwen38JLensEngine(loaded)
     input_ids = torch.randint(0, V - 2, (1, T))
 
-    # Fast single-sweep engine Jacobian (including embedding layer -1!)
+    # Fast single-sweep engine Jacobian with 16-aligned suffix pruning (bwd_start=16, T_v=32) AND unpruned (bwd_align=0)
     src_layers = [-1, 0, 1, 2, 3]
-    J_fast, seq_len, n_valid, _, _ = engine.jacobian_for_tokens(input_ids, source_layers=src_layers, skip_first=skip_first)
+    J_fast, seq_len, n_valid, _, _ = engine.jacobian_for_tokens(
+        input_ids, source_layers=src_layers, skip_first=skip_first, bwd_align=16
+    )
+    J_full_bwd, _, _, _, _ = engine.jacobian_for_tokens(
+        input_ids, source_layers=src_layers, skip_first=skip_first, bwd_align=0
+    )
     assert seq_len == T and n_valid == T - skip_first - 1
 
     # Reference Anthropic jlens estimator via full PyTorch autograd starting from embed_tokens!
@@ -548,7 +656,11 @@ def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     for l, g_ref in zip(src_layers, grads, strict=True):
         J_ref_l = g_ref[:, valid_pos, :].mean(dim=1)
         max_diff = (J_fast[l] - J_ref_l).abs().max().item()
-        assert torch.allclose(J_fast[l], J_ref_l, atol=1e-4), f"Layer {l} mismatch: max_diff={max_diff}"
+        assert torch.allclose(J_fast[l], J_ref_l, atol=1e-4), f"Layer {l} mismatch vs autograd: max_diff={max_diff}"
+        pruned_vs_full = (J_fast[l] - J_full_bwd[l]).abs().max().item()
+        assert torch.allclose(J_fast[l], J_full_bwd[l], atol=1e-5), (
+            f"Layer {l} mismatch between suffix-pruned and full backward: max_diff={pruned_vs_full}"
+        )
 
     # Collapsed embedding Jacobian sum_{b=0..3} J_{-1}[:, b, :] must match exact d h_final / d emb!
     J_emb_collapsed = J_fast[-1].view(D, hc, D).sum(dim=1)

@@ -10,7 +10,7 @@ from qwen38_jlens.checkpoint import (
     publish_bundle_to_hf,
     save_jlens_safetensors,
 )
-from qwen38_jlens.engine import FitStats, Qwen38JLensEngine, valid_position_mask
+from qwen38_jlens.engine import FitStats, Qwen38JLensEngine, compute_aligned_bwd_start, valid_position_mask
 from qwen38_jlens.hardware import HardwareProfile, OffloadPlan, StorageTier, build_offload_plan, detect_hardware
 from qwen38_jlens.kernels import GatedDeltaRuleBackend, dequantize_fp8_blockwise, grouped_mm, swiglu_vjp_pack
 from qwen38_jlens.lens import Qwen38JacobianLens, render_slice_html
@@ -35,6 +35,7 @@ __all__ = [
     "Qwen38TextConfig",
     "StorageTier",
     "build_offload_plan",
+    "compute_aligned_bwd_start",
     "dequantize_fp8_blockwise",
     "detect_hardware",
     "export_neuronpedia_bundle",

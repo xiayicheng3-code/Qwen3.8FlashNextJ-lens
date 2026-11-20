@@ -46,6 +46,7 @@ from qwen38_jlens.model_ops import (
     decoder_layer_vjp_inplace,
     gated_residual_fwd,
     gated_residual_vjp,
+    slice_gated_residual_saved,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,26 @@ def valid_position_mask(seq_len: int, *, skip_first: int = SKIP_FIRST_N_POSITION
     if int(mask.sum().item()) == 0:
         raise ValueError(f"prompt too short: seq_len={seq_len}, need > {skip_first + 1} tokens")
     return mask
+
+
+def compute_aligned_bwd_start(seq_len: int, skip_first: int, *, align: int = 16) -> int:
+    """Choose the largest suffix start `bwd_start <= skip_first` so `T_v = seq_len - bwd_start` is `align`-aligned.
+
+    Exploits strict causal lower-triangularity of every layer: cotangents at masked prefix
+    tokens `[0 : bwd_start]` never influence valid suffix tokens `[skip_first : seq_len - 1]`.
+    Rounding `T_v` up to a multiple of `align = 16` (e.g. `T = 128, skip_first = 16 -> T_v = 112`)
+    frees 12.5% of cotangent VRAM (`6.25 -> 5.47 GiB`) and skips prefix MoE/projection/QSA backward
+    FLOPs while preserving 16-aligned Tensor Core / TMA shapes on QSA `bmm` and 128-aligned shapes
+    on MoE `grouped_mm`, dense projections (`M = K_blk * T_v`), and zero-padded FlashQLA/FLA.
+    Pass `align <= 0` to disable suffix pruning (`bwd_start = 0`).
+    """
+    if align <= 0 or skip_first <= 0:
+        return 0
+    if align == 1:
+        return min(skip_first, seq_len)
+    min_tv = max(1, seq_len - skip_first)
+    aligned_tv = min(seq_len, ((min_tv + align - 1) // align) * align)
+    return seq_len - aligned_tv
 
 
 def _copy_payload_async(dst: MoeExpertPayload, src: MoeExpertPayload, non_blocking: bool) -> None:
@@ -361,6 +382,7 @@ class Qwen38JLensEngine:
         source_layers: Sequence[int],
         *,
         skip_first: int = SKIP_FIRST_N_POSITIONS,
+        bwd_align: int = 16,
     ) -> tuple[dict[int, torch.Tensor], int, int, float, float]:
         """Compute exact per-prompt `J_l = E[d h_final / d H_l]` (`[D, hc_count * D]` fp32 CPU) for all `source_layers`.
 
@@ -368,11 +390,12 @@ class Qwen38JLensEngine:
         whose 4-branch sum `J_collapsed[-1] = sum_b J_{-1}[:, b, :]` equals the exact token-embedding Jacobian
         `E[d h_final / d emb]`.
 
-        Uses single-sweep layer-by-layer reverse propagation:
-          - Forward sweep (0 -> L-1): saves ONLY `[1, T, 10240]` layer inputs (~120 MB total!).
-          - Backward sweep (L-1 -> min_source + 1): holds ALL `k_pass` cotangents in ONE in-place
-            GPU buffer `G`, dequantizing each layer's hit experts ONCE and overlapping next-layer
-            DMA/NVMe prefetch 100% behind backward compute!
+        Uses single-sweep layer-by-layer reverse propagation with 16-aligned exact causal suffix pruning:
+          - Forward sweep (0 -> L-1): runs on full `[0:T]`, saving ONLY `[1, T, 10240]` layer inputs (~120 MB total!).
+          - Backward sweep (L-1 -> min_source + 1): drops masked prefix tokens `[0 : bwd_start]` while keeping
+            `T_v = T - bwd_start` aligned to `bwd_align` (e.g. `112` at `T=128, skip_first=16`), holds ALL `k_pass`
+            cotangents in ONE in-place GPU buffer `G [k_pass, T_v, 10240]` (5.47 GiB vs 6.25 GiB), dequantizes
+            only suffix-hit experts ONCE, and overlaps next-layer DMA/NVMe prefetch 100% behind backward compute!
         """
         t0 = time.perf_counter()
         input_ids = input_ids.to(self.device)
@@ -380,6 +403,9 @@ class Qwen38JLensEngine:
         pos_mask = valid_position_mask(T, skip_first=skip_first)
         valid_pos = pos_mask.nonzero(as_tuple=True)[0].to(self.device)
         n_valid = int(valid_pos.numel())
+        bwd_start = compute_aligned_bwd_start(T, skip_first, align=bwd_align)
+        T_v = T - bwd_start
+        valid_pos_local = valid_pos - bwd_start
 
         D = self.cfg.hidden_size
         hc = self.cfg.hc_count
@@ -425,11 +451,12 @@ class Qwen38JLensEngine:
 
         # Final hyper_connection_mixer forward (H_{L-1} -> h_final [1, T, D])
         _, _, mixer_saved = gated_residual_fwd(H, self.model.hyper_connection_mixer)
+        mixer_saved_v = slice_gated_residual_saved(mixer_saved, bwd_start)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t_fwd = time.perf_counter() - t0
 
-        # ---- 2. Backward Sweep (L-1 -> min_src + 1, k_pass cotangents at once!) ----
+        # ---- 2. Backward Sweep (L-1 -> min_src + 1, k_pass cotangents on [bwd_start:]!) ----
         t_bwd_start = time.perf_counter()
         jacobians = {l: torch.zeros((D, D_hc), dtype=torch.float32) for l in src_list}
         k_pass = min(self.plan.k_pass, D)
@@ -439,10 +466,10 @@ class Qwen38JLensEngine:
             k_end = min(k_start + k_pass, D)
             K_cur = k_end - k_start
 
-            # Build initial one-hot cotangent at target h_final for valid positions,
-            # then immediately backprop through hyper_connection_mixer -> G_{L-1} [K_cur, T, D_hc]!
-            G = torch.zeros((K_cur, T, D_hc), device=self.device, dtype=self.dtype)
-            d_target_chunk = torch.zeros((min(self.plan.moe_k_chunk, K_cur), T, D), device=self.device, dtype=self.dtype)
+            # Build initial one-hot cotangent at target h_final for valid positions on [bwd_start:],
+            # then immediately backprop through hyper_connection_mixer -> G_{L-1} [K_cur, T_v, D_hc]!
+            G = torch.zeros((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
+            d_target_chunk = torch.zeros((min(self.plan.moe_k_chunk, K_cur), T_v, D), device=self.device, dtype=self.dtype)
             k_sub_idx = torch.arange(d_target_chunk.shape[0], device=self.device)
             for c0 in range(0, K_cur, d_target_chunk.shape[0]):
                 c1 = min(c0 + d_target_chunk.shape[0], K_cur)
@@ -450,23 +477,23 @@ class Qwen38JLensEngine:
                 d_target_chunk[:nc].zero_()
                 d_target_chunk[
                     k_sub_idx[:nc, None],
-                    valid_pos[None, :],
+                    valid_pos_local[None, :],
                     (k_start + c0) + k_sub_idx[:nc, None],
                 ] = 1.0
                 G[c0:c1] = gated_residual_vjp(
-                    d_target_chunk[:nc], None, self.model.hyper_connection_mixer, mixer_saved
+                    d_target_chunk[:nc], None, self.model.hyper_connection_mixer, mixer_saved_v
                 )
             del d_target_chunk
 
             # Layer L-1 output H_{L-1} Jacobian!
             if (n_layers - 1) in src_set:
-                rows = G[:, valid_pos, :].float().mean(dim=1).cpu()
+                rows = G[:, valid_pos_local, :].float().mean(dim=1).cpu()
                 jacobians[n_layers - 1][k_start:k_end, :] = rows
 
             # Reverse layer sweep: L-1 -> min_src + 1
             for l_idx, experts in self.streamer.iter_sweep(bwd_layers):
-                # Recompute ONE tiny B=1 forward of layer l_idx (~0.5 ms), keeping active experts
-                # dequantized in BF16 when E_hit <= expert_dequant_chunk!
+                # Recompute ONE tiny B=1 forward of layer l_idx (~0.5 ms), keeping suffix-hit active
+                # experts dequantized in BF16 when E_hit <= expert_dequant_chunk!
                 _, saved_l = decoder_layer_fwd(
                     layer_inputs[l_idx],
                     self.model.layers[l_idx],
@@ -478,9 +505,10 @@ class Qwen38JLensEngine:
                     dequant_chunk_size=self.plan.expert_dequant_chunk,
                     use_triton_dequant=self.plan.use_triton_fp8_dequant,
                     keep_experts_dequantized=True,
+                    bwd_start=bwd_start,
                 )
 
-                # In-place VJP across ALL K_cur cotangents!
+                # In-place VJP across ALL K_cur cotangents on [bwd_start:]!
                 decoder_layer_vjp_inplace(
                     G,
                     self.model.layers[l_idx],
@@ -495,10 +523,10 @@ class Qwen38JLensEngine:
                 )
                 del saved_l
 
-                # After layer l_idx backward, G is now d h_final / d H_{l_idx - 1}!
+                # After layer l_idx backward, G is now d h_final / d H_{l_idx - 1} on [bwd_start:]!
                 prev_layer = l_idx - 1
                 if prev_layer in src_set:
-                    rows = G[:, valid_pos, :].float().mean(dim=1).cpu()
+                    rows = G[:, valid_pos_local, :].float().mean(dim=1).cpu()
                     jacobians[prev_layer][k_start:k_end, :] = rows
 
             del G
@@ -515,6 +543,7 @@ class Qwen38JLensEngine:
         source_layers: Sequence[int] | None = None,
         include_embedding_layer: bool = False,
         skip_first: int = SKIP_FIRST_N_POSITIONS,
+        bwd_align: int = 16,
         checkpoint_path: str | None = None,
         checkpoint_every: int = 10,
         checkpoint_manager: Any | None = None,
@@ -530,6 +559,8 @@ class Qwen38JLensEngine:
         Supports:
           - `include_embedding_layer=True` (or `-1` in `source_layers`) to include layer `-1`
             (`embed_tokens -> H_{-1}` before Layer 0, where `J_collapsed[-1] = d h_final / d emb`).
+          - `bwd_align=16` (default): exact 16-aligned causal suffix-only backward pruning of masked
+            prefix tokens `[0 : bwd_start]` (`bwd_align=0` disables pruning).
           - `checkpoint_manager=AsyncCheckpointManager(...)` (recommended: Local NVMe + async Google Drive
             during fitting, plus one-shot `publish_bundle_to_hf(...)` once complete!), OR
           - `checkpoint_path=".../ckpt.safetensors"` (or legacy `.pt`) for simple local checkpointing.
@@ -622,7 +653,7 @@ class Qwen38JLensEngine:
                 t0 = time.perf_counter()
                 try:
                     per_J, seq_len, n_valid, t_fwd, t_bwd = self.jacobian_for_tokens(
-                        ids, src_layers, skip_first=skip_first
+                        ids, src_layers, skip_first=skip_first, bwd_align=bwd_align
                     )
                 except ValueError as exc:
                     logger.warning("Skipping prompt %d: %s", p_idx, exc)

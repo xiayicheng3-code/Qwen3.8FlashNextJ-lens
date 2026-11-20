@@ -302,6 +302,16 @@ def gated_residual_vjp(
     return rmsnorm_vjp(d_h_norm, saved["x_hat"], saved["rstd"], w.hc_norm_weight, group_size=w.hidden_size)
 
 
+def slice_gated_residual_saved(saved: dict[str, Any], bwd_start: int) -> dict[str, Any]:
+    """Slice a `gated_residual_fwd` saved dict along token dim 1 to `[bwd_start:]`."""
+    if bwd_start <= 0:
+        return saved
+    return {
+        k: (v[:, bwd_start:].contiguous() if isinstance(v, torch.Tensor) else v)
+        for k, v in saved.items()
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 3. Exact PLE Layer Forward & VJP (Layer 2 only; n-gram lookup is constant wrt H)
 # --------------------------------------------------------------------------- #
@@ -505,77 +515,98 @@ def qsa_layer_fwd(
 
 
 def qsa_layer_vjp(
-    d_out: torch.Tensor,  # [K_sub, T, D]
+    d_out: torch.Tensor,  # [K_sub, T_v, D] where T_v = T_full - bwd_start
     w: QsaLayerWeights,
     saved: dict[str, Any],
+    *,
+    bwd_start: int = 0,
 ) -> torch.Tensor:
-    """Exact batched-cotangent VJP of `Qwen4ExpTextAttention` -> `[K_sub, T, D]`."""
-    K_sub, T, _ = d_out.shape
+    """Exact batched-cotangent VJP of `Qwen4ExpTextAttention` on suffix `[bwd_start:]` -> `[K_sub, T_v, D]`."""
+    K_sub, T_v, _ = d_out.shape
+    s = int(bwd_start)
+    T_full = int(saved["q_rot"].shape[1])
+    assert T_v == T_full - s, f"Expected T_v={T_full - s}, got {T_v}"
     H_q, H_kv, Dh = w.num_q_heads, w.num_kv_heads, w.head_dim
     n_rep = H_q // H_kv
     dtype = d_out.dtype
 
-    # 1. o_proj & sigmoid output gate VJP
-    d_gated = torch.matmul(d_out, w.o_proj)  # [K_sub, T, H_q * Dh]
-    d_gate = d_gated * saved["attn_out"].unsqueeze(0) * saved["d_sig_gate"].unsqueeze(0)
-    d_attn_flat = d_gated * saved["sig_gate"].unsqueeze(0)
-    dO = d_attn_flat.view(K_sub, T, H_q, Dh).transpose(1, 2).contiguous()  # [K_sub, H_q, T, Dh]
+    # 1. o_proj & sigmoid output gate VJP (pointwise on [s:])
+    attn_out_s = saved["attn_out"][s:] if s > 0 else saved["attn_out"]
+    sig_gate_s = saved["sig_gate"][s:] if s > 0 else saved["sig_gate"]
+    d_sig_gate_s = saved["d_sig_gate"][s:] if s > 0 else saved["d_sig_gate"]
 
-    # 2. Core causal attention VJP
+    d_gated = torch.matmul(d_out, w.o_proj)  # [K_sub, T_v, H_q * Dh]
+    d_gate = d_gated * attn_out_s.unsqueeze(0) * d_sig_gate_s.unsqueeze(0)
+    d_attn_flat = d_gated * sig_gate_s.unsqueeze(0)
+    dO = d_attn_flat.view(K_sub, T_v, H_q, Dh).transpose(1, 2).contiguous()  # [K_sub, H_q, T_v, Dh]
+
+    # 2. Core causal attention VJP (exact suffix-to-suffix block A_VV + exact dQ[s:] over full keys [0:T_full])
     if saved["attn_mode"] == "l2_cached":
-        P = saved["P"]                                # [H_q, T, T] fp32
-        P_t = P.to(dtype)                             # [H_q, T, T]
-        Q_1 = saved["q_rot"]                          # [H_q, T, Dh]
-        K_1 = saved["k_rep"]                          # [H_q, T, Dh]
-        V_1 = saved["v_rep"]                          # [H_q, T, Dh]
+        P = saved["P"]                                                     # [H_q, T_full, T_full] fp32
+        P_vv_t = (P[:, s:, s:] if s > 0 else P).to(dtype).contiguous()     # [H_q, T_v, T_v]
+        P_va = P[:, s:, :] if s > 0 else P                                 # [H_q, T_v, T_full] fp32
+        Q_v = (saved["q_rot"][:, s:, :] if s > 0 else saved["q_rot"]).contiguous()  # [H_q, T_v, Dh]
+        K_all = saved["k_rep"]                                             # [H_q, T_full, Dh]
+        V_all = saved["v_rep"]                                             # [H_q, T_full, Dh]
 
-        # Reorder dO to [H_q, K_sub, T, Dh] -> [H_q, K_sub*T, Dh] for pure 3D batched GEMMs!
-        dO_h = dO.transpose(0, 1).contiguous()        # [H_q, K_sub, T, Dh]
+        dO_h = dO.transpose(0, 1).contiguous()                             # [H_q, K_sub, T_v, Dh]
 
-        # dV = P^T @ dO: [H_q, T, T] @ [H_q, T, K_sub*Dh] -> [H_q, T, K_sub, Dh]
-        dO_for_v = dO_h.permute(0, 2, 1, 3).reshape(H_q, T, K_sub * Dh)
-        dV_rep = torch.bmm(P_t.transpose(1, 2), dO_for_v).view(H_q, T, K_sub, Dh).permute(2, 0, 1, 3)
+        # dV[s:] = P[s:, s:]^T @ dO[s:] (causal: P[q, k] = 0 for q < k => prefix q < s never contributes to k >= s)
+        dO_for_v = dO_h.permute(0, 2, 1, 3).reshape(H_q, T_v, K_sub * Dh)
+        dV_rep = torch.bmm(P_vv_t.transpose(1, 2), dO_for_v).view(H_q, T_v, K_sub, Dh).permute(2, 0, 1, 3)
 
-        # dP = dO @ V^T: [H_q, K_sub*T, Dh] @ [H_q, Dh, T] -> [H_q, K_sub, T, T]
-        dP = torch.bmm(dO_h.view(H_q, K_sub * T, Dh), V_1.transpose(1, 2)).view(H_q, K_sub, T, T)
+        # dP[s:, 0:T_full] = dO[s:] @ V[0:T_full]^T
+        dP = torch.bmm(dO_h.view(H_q, K_sub * T_v, Dh), V_all.transpose(1, 2)).view(H_q, K_sub, T_v, T_full)
 
-        # Softmax VJP in fp32: dS = P * (dP - sum(dP * P)) * scaling
+        # Softmax VJP in fp32 over full causal support [0:T_full]: dS = P * (dP - sum(dP * P)) * scaling
         dP_f = dP.float()
-        P_b = P.unsqueeze(1)
-        D_dot = (dP_f * P_b).sum(dim=-1, keepdim=True)
-        dS = ((P_b * (dP_f - D_dot)) * saved["scaling"]).to(dtype)  # [H_q, K_sub, T, T]
+        P_va_b = P_va.unsqueeze(1)
+        D_dot = (dP_f * P_va_b).sum(dim=-1, keepdim=True)
+        dS = ((P_va_b * (dP_f - D_dot)) * saved["scaling"]).to(dtype)      # [H_q, K_sub, T_v, T_full]
 
-        # dQ = dS @ K: [H_q, K_sub*T, T] @ [H_q, T, Dh] -> [K_sub, H_q, T, Dh]
-        dQ_rot = torch.bmm(dS.view(H_q, K_sub * T, T), K_1).view(H_q, K_sub, T, Dh).transpose(0, 1)
+        # dQ[s:] = dS[s:, 0:T_full] @ K[0:T_full]
+        dQ_rot = torch.bmm(dS.view(H_q, K_sub * T_v, T_full), K_all).view(H_q, K_sub, T_v, Dh).transpose(0, 1)
 
-        # dK = dS^T @ Q: reshape dS^T to [H_q, T, K_sub, T]? Loop-free via matmul:
-        # dS_perm: [H_q, K_sub, T_k, T_q] @ Q_1 [H_q, 1, T_q, Dh] -> [H_q, K_sub, T_k, Dh]
-        dK_rep = torch.matmul(dS.transpose(-1, -2), Q_1.unsqueeze(1)).transpose(0, 1)  # [K_sub, H_q, T, Dh]
+        # dK[s:] = dS[s:, s:]^T @ Q[s:] (causal: dS[q, k] = 0 for q < k)
+        dS_vv = dS[:, :, :, s:] if s > 0 else dS                           # [H_q, K_sub, T_v, T_v]
+        dK_rep = torch.bmm(
+            dS_vv.transpose(-1, -2).reshape(H_q, K_sub * T_v, T_v), Q_v
+        ).view(H_q, K_sub, T_v, Dh).transpose(0, 1)                         # [K_sub, H_q, T_v, Dh]
     else:
         with torch.enable_grad():
             q_e = saved["q_rot"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
             k_e = saved["k_rep"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
             v_e = saved["v_rep"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
             o_e = F.scaled_dot_product_attention(q_e, k_e, v_e, is_causal=True, scale=saved["scaling"])
-            dQ_rot, dK_rep, dV_rep = torch.autograd.grad(o_e, (q_e, k_e, v_e), grad_outputs=dO)
+            dO_full = F.pad(dO, (0, 0, s, 0)) if s > 0 else dO
+            dQ_rot, dK_rep, dV_rep = torch.autograd.grad(o_e, (q_e, k_e, v_e), grad_outputs=dO_full)
+            if s > 0:
+                dQ_rot = dQ_rot[:, :, s:, :]
+                dK_rep = dK_rep[:, :, s:, :]
+                dV_rep = dV_rep[:, :, s:, :]
 
     # Reduce GQA heads H_q -> H_kv
-    dK_rot = dK_rep.view(K_sub, H_kv, n_rep, T, Dh).sum(dim=2)  # [K_sub, H_kv, T, Dh]
-    dV = dV_rep.view(K_sub, H_kv, n_rep, T, Dh).sum(dim=2)      # [K_sub, H_kv, T, Dh]
+    dK_rot = dK_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)           # [K_sub, H_kv, T_v, Dh]
+    dV = dV_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)               # [K_sub, H_kv, T_v, Dh]
 
-    # 3. Inverse partial RoPE: exact transpose is (cos, -sin)
-    cos, sin = saved["cos"], saved["sin"]
-    dQ_normed = apply_partial_rope(dQ_rot, cos, -sin).transpose(1, 2)  # [K_sub, T, H_q, Dh]
-    dK_normed = apply_partial_rope(dK_rot, cos, -sin).transpose(1, 2)  # [K_sub, T, H_kv, Dh]
+    # 3. Inverse partial RoPE on [s:]
+    cos = saved["cos"][:, :, s:, :] if s > 0 else saved["cos"]
+    sin = saved["sin"][:, :, s:, :] if s > 0 else saved["sin"]
+    dQ_normed = apply_partial_rope(dQ_rot, cos, -sin).transpose(1, 2)      # [K_sub, T_v, H_q, Dh]
+    dK_normed = apply_partial_rope(dK_rot, cos, -sin).transpose(1, 2)      # [K_sub, T_v, H_kv, Dh]
 
-    # 4. q_norm & k_norm VJP
-    dQ_raw = rmsnorm_vjp(dQ_normed, saved["q_xhat"], saved["q_rstd"], w.q_norm)
-    dK_raw = rmsnorm_vjp(dK_normed, saved["k_xhat"], saved["k_rstd"], w.k_norm)
+    # 4. q_norm & k_norm VJP on [s:]
+    q_xhat = saved["q_xhat"][:, s:] if s > 0 else saved["q_xhat"]
+    q_rstd = saved["q_rstd"][:, s:] if s > 0 else saved["q_rstd"]
+    k_xhat = saved["k_xhat"][:, s:] if s > 0 else saved["k_xhat"]
+    k_rstd = saved["k_rstd"][:, s:] if s > 0 else saved["k_rstd"]
+    dQ_raw = rmsnorm_vjp(dQ_normed, q_xhat, q_rstd, w.q_norm)
+    dK_raw = rmsnorm_vjp(dK_normed, k_xhat, k_rstd, w.k_norm)
 
-    # 5. Pack [dQ_raw, d_gate] matching q_proj output layout [K_sub, T, H_q, 2*Dh]
-    dQG = torch.cat([dQ_raw, d_gate.view(K_sub, T, H_q, Dh)], dim=-1).reshape(K_sub, T, H_q * Dh * 2)
-    dK_flat = dK_raw.reshape(K_sub, T, H_kv * Dh)
-    dV_flat = dV.transpose(1, 2).reshape(K_sub, T, H_kv * Dh)
+    # 5. Pack [dQ_raw, d_gate] matching q_proj output layout [K_sub, T_v, H_q, 2*Dh]
+    dQG = torch.cat([dQ_raw, d_gate.view(K_sub, T_v, H_q, Dh)], dim=-1).reshape(K_sub, T_v, H_q * Dh * 2)
+    dK_flat = dK_raw.reshape(K_sub, T_v, H_kv * Dh)
+    dV_flat = dV.transpose(1, 2).reshape(K_sub, T_v, H_kv * Dh)
 
     d_x = (
         torch.matmul(dQG, w.q_proj)
@@ -633,41 +664,57 @@ def gdn_layer_fwd(
 
 
 def gdn_layer_vjp(
-    d_out: torch.Tensor,  # [K_sub, T, D]
+    d_out: torch.Tensor,  # [K_sub, T_v, D]
     w: GdnLayerWeights,
     saved: dict[str, Any],
     gdn_backend: GatedDeltaRuleBackend,
+    *,
+    bwd_start: int = 0,
 ) -> torch.Tensor:
-    """Exact batched-cotangent VJP of `Qwen4ExpTextGatedDeltaNet` -> `[K_sub, T, D]`."""
-    K_sub, T, _ = d_out.shape
+    """Exact batched-cotangent VJP of `Qwen4ExpTextGatedDeltaNet` on suffix `[bwd_start:]` -> `[K_sub, T_v, D]`."""
+    K_sub, T_v, _ = d_out.shape
+    s = int(bwd_start)
     val_dim = w.num_v_heads * w.head_v_dim
     dtype = d_out.dtype
 
-    # 1. out_proj & RMSNormGated VJP
-    d_norm_out = torch.matmul(d_out, w.out_proj).view(K_sub, T, w.num_v_heads, w.head_v_dim)
-    d_core_out, d_z = rmsnorm_gated_vjp(d_norm_out, saved["norm_saved"])
+    # 1. out_proj & RMSNormGated VJP on [s:]
+    d_norm_out = torch.matmul(d_out, w.out_proj).view(K_sub, T_v, w.num_v_heads, w.head_v_dim)
+    if s > 0:
+        norm_s = {k: (v[:, s:] if v.ndim == 4 else v) for k, v in saved["norm_saved"].items()}
+    else:
+        norm_s = saved["norm_saved"]
+    d_core_out, d_z = rmsnorm_gated_vjp(d_norm_out, norm_s)
 
-    # 2. Core Gated Delta Rule VJP (FlashQLA SM120 / FLA SM80 / PyTorch)
-    dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(saved["gdn_saved"], d_core_out)
+    # 2. Core Gated Delta Rule VJP (zero-pad [0:s] to preserve exact 128-aligned FlashQLA/FLA tiles!)
+    d_core_in = F.pad(d_core_out, (0, 0, 0, 0, s, 0)) if s > 0 else d_core_out
+    dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(saved["gdn_saved"], d_core_in)
+    if s > 0:
+        dq = dq[:, s:]
+        dk = dk[:, s:]
+        dv = dv[:, s:]
+        dg = dg[:, s:]
+        dbeta = dbeta[:, s:]
 
-    # 3. Gate activations VJP: beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
-    beta_f = saved["beta"].float()
+    # 3. Gate activations VJP on [s:]: beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
+    beta_f = (saved["beta"][:, s:] if s > 0 else saved["beta"]).float()
+    sig_adt = saved["sig_a_plus_dt"][:, s:] if s > 0 else saved["sig_a_plus_dt"]
     db = (dbeta.float() * beta_f * (1.0 - beta_f)).to(dtype)
-    da = (dg.float() * saved["neg_exp_A"] * saved["sig_a_plus_dt"]).to(dtype)
+    da = (dg.float() * saved["neg_exp_A"] * sig_adt).to(dtype)
 
-    # 4. Pack [dq, dk, dv] -> causal_conv1d + SiLU VJP
+    # 4. Pack [dq, dk, dv] -> causal_conv1d + SiLU VJP on [s:] (causal adjoint only looks at t' >= t >= s!)
     d_mixed_t = torch.cat(
-        [dq.reshape(K_sub, T, -1), dk.reshape(K_sub, T, -1), dv.reshape(K_sub, T, -1)],
+        [dq.reshape(K_sub, T_v, -1), dk.reshape(K_sub, T_v, -1), dv.reshape(K_sub, T_v, -1)],
         dim=-1,
     )
+    pre_silu_s = saved["conv_pre_silu"][:, :, s:] if s > 0 else saved["conv_pre_silu"]
     d_conv_in = causal_conv1d_silu_bwd(
-        d_mixed_t.transpose(1, 2), saved["conv_pre_silu"], w.conv1d_weight
-    ).transpose(1, 2)  # [K_sub, T, conv_dim]
+        d_mixed_t.transpose(1, 2), pre_silu_s, w.conv1d_weight
+    ).transpose(1, 2)  # [K_sub, T_v, conv_dim]
 
-    # 5. Input projections VJP
+    # 5. Input projections VJP on [s:]
     d_x = (
         torch.matmul(d_conv_in, w.in_proj_qkv)
-        + torch.matmul(d_z.reshape(K_sub, T, val_dim), w.in_proj_z)
+        + torch.matmul(d_z.reshape(K_sub, T_v, val_dim), w.in_proj_z)
         + torch.matmul(db, w.in_proj_b)
         + torch.matmul(da, w.in_proj_a)
     )
@@ -1009,6 +1056,20 @@ def moe_block_vjp_all(
 # --------------------------------------------------------------------------- #
 # 7. Complete Single-Layer Forward (`B=1`) & Full-Cotangent In-Place Backward
 # --------------------------------------------------------------------------- #
+def _slice_ple_saved(saved: dict[str, Any], bwd_start: int) -> dict[str, Any]:
+    if bwd_start <= 0:
+        return saved
+    out: dict[str, Any] = {}
+    for k, v in saved.items():
+        if k == "d_silu_conv":
+            out[k] = v[:, :, bwd_start:].contiguous()
+        elif isinstance(v, torch.Tensor):
+            out[k] = v[:, bwd_start:].contiguous()
+        else:
+            out[k] = v
+    return out
+
+
 def decoder_layer_fwd(
     H_in: torch.Tensor,  # [1, T, hc_count * D]
     layer_w: DecoderLayerDenseWeights,
@@ -1021,16 +1082,25 @@ def decoder_layer_fwd(
     dequant_chunk_size: int = 512,
     use_triton_dequant: bool = True,
     keep_experts_dequantized: bool = False,
+    bwd_start: int = 0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Run ONE `B=1` forward of `Qwen4ExpTextDecoderLayer`; returns `(H_out, saved)`."""
+    """Run ONE `B=1` forward of `Qwen4ExpTextDecoderLayer`; returns `(H_out, saved)`.
+
+    When `bwd_start > 0` (backward-recompute mode for prefix-masked J-lens):
+      - Causal token mixers (PLE, GDN/QSA) still run on full `[0:T]` so context/softmax/state
+        entering `bwd_start` is 100% exact.
+      - Pointwise `mlp_hc` + `SparseMoE` run strictly on the suffix `[bwd_start:]`, skipping
+        masked prefix tokens and reducing unique hit experts `E_hit` to dequantize!
+    """
     saved: dict[str, Any] = {}
+    s = int(bwd_start)
 
     # 1. Optional PLE injection (layer 2 only)
     if layer_w.ple is not None:
         assert ple_embeddings is not None, f"Layer {layer_w.layer_idx} requires ple_embeddings."
         ple_delta, ple_saved = ple_layer_fwd(H_in, ple_embeddings, layer_w.ple)
         H_ple = H_in + ple_delta
-        saved["ple_saved"] = ple_saved
+        saved["ple_saved"] = _slice_ple_saved(ple_saved, s)
     else:
         H_ple = H_in
 
@@ -1044,10 +1114,19 @@ def decoder_layer_fwd(
         assert layer_w.qsa is not None
         y_attn, mixer_saved = qsa_layer_fwd(x_attn, layer_w.qsa, cos, sin)
 
-    H_mid = H_ple + (y_attn.unsqueeze(-2) * w_attn.unsqueeze(-1)).flatten(-2)
+    if s > 0:
+        H_mid_s = H_ple[:, s:, :] + (y_attn[:, s:, :].unsqueeze(-2) * w_attn[:, s:, :].unsqueeze(-1)).flatten(-2)
+        attn_hc_saved_bwd = slice_gated_residual_saved(attn_hc_saved, s)
+        y_attn_bwd = y_attn[0, s:].contiguous()
+        w_attn_bwd = w_attn[0, s:].contiguous()
+    else:
+        H_mid_s = H_ple + (y_attn.unsqueeze(-2) * w_attn.unsqueeze(-1)).flatten(-2)
+        attn_hc_saved_bwd = attn_hc_saved
+        y_attn_bwd = y_attn[0]
+        w_attn_bwd = w_attn[0]
 
-    # 3. MLP Hyper-Connection + Sparse MoE + Residual Injection
-    x_mlp, w_mlp, mlp_hc_saved = gated_residual_fwd(H_mid, layer_w.mlp_hc)
+    # 3. Pointwise MLP Hyper-Connection + Sparse MoE + Residual Injection (strictly on [s:])
+    x_mlp, w_mlp, mlp_hc_saved = gated_residual_fwd(H_mid_s, layer_w.mlp_hc)
     assert w_mlp is not None
     y_mlp, moe_saved = moe_block_fwd(
         x_mlp,
@@ -1057,14 +1136,15 @@ def decoder_layer_fwd(
         use_triton_dequant=use_triton_dequant,
         keep_dequantized_for_bwd=keep_experts_dequantized,
     )
-    H_out = H_mid + (y_mlp.unsqueeze(-2) * w_mlp.unsqueeze(-1)).flatten(-2)
+    H_out = H_mid_s + (y_mlp.unsqueeze(-2) * w_mlp.unsqueeze(-1)).flatten(-2)
 
     saved.update(
         {
-            "attn_hc_saved": attn_hc_saved,
+            "bwd_start": s,
+            "attn_hc_saved": attn_hc_saved_bwd,
             "mixer_saved": mixer_saved,
-            "y_attn": y_attn[0],
-            "w_attn": w_attn[0],
+            "y_attn": y_attn_bwd,
+            "w_attn": w_attn_bwd,
             "mlp_hc_saved": mlp_hc_saved,
             "moe_saved": moe_saved,
             "y_mlp": y_mlp[0],
@@ -1075,7 +1155,7 @@ def decoder_layer_fwd(
 
 
 def decoder_layer_vjp_inplace(
-    G: torch.Tensor,  # [K_total, T, hc_count * D] — UPDATED IN-PLACE TO G_in!
+    G: torch.Tensor,  # [K_total, T_v, hc_count * D] — UPDATED IN-PLACE TO G_in!
     layer_w: DecoderLayerDenseWeights,
     experts: MoeExpertPayload,
     saved: dict[str, Any],
@@ -1089,22 +1169,22 @@ def decoder_layer_vjp_inplace(
 ) -> torch.Tensor:
     """Exact in-place VJP of `Qwen4ExpTextDecoderLayer` across ALL `K_total` cotangents.
 
-    Updates `G` in-place so peak GPU cotangent memory stays at ONLY 1x `G_curr` (6.25 GiB)!
+    Updates `G` in-place so peak GPU cotangent memory stays at ONLY 1x `G_curr` (5.47 GiB at T_v=112)!
     """
-    K_total, T, D_hc = G.shape
+    K_total, T_v, D_hc = G.shape
     hc = layer_w.mlp_hc.hc_count
     D = layer_w.mlp_hc.hidden_size
+    bwd_start = int(saved.get("bwd_start", 0))
 
-    # ---- Stage A: MLP Injection + SparseMoE + MLP Hyper-Connection ----
-    y_mlp = saved["y_mlp"]  # [T, D]
-    w_mlp = saved["w_mlp"]  # [T, hc]
+    # ---- Stage A: MLP Injection + SparseMoE + MLP Hyper-Connection (on [bwd_start:]) ----
+    y_mlp = saved["y_mlp"]  # [T_v, D]
+    w_mlp = saved["w_mlp"]  # [T_v, hc]
 
-    # Compute d_y_mlp [K_total, T, D] and d_w_mlp [K_total, T, hc] in small chunks to avoid extra 6.25 GiB temp
-    d_y_mlp = torch.empty((K_total, T, D), device=G.device, dtype=G.dtype)
-    d_w_mlp = torch.empty((K_total, T, hc), device=G.device, dtype=G.dtype)
+    d_y_mlp = torch.empty((K_total, T_v, D), device=G.device, dtype=G.dtype)
+    d_w_mlp = torch.empty((K_total, T_v, hc), device=G.device, dtype=G.dtype)
     for k0 in range(0, K_total, moe_k_chunk):
         k1 = min(k0 + moe_k_chunk, K_total)
-        g4 = G[k0:k1].view(k1 - k0, T, hc, D)
+        g4 = G[k0:k1].view(k1 - k0, T_v, hc, D)
         d_y_mlp[k0:k1] = (g4 * w_mlp[None, :, :, None]).sum(dim=2)
         d_w_mlp[k0:k1] = (g4.float() * y_mlp.float()[None, :, None, :]).sum(dim=-1).to(G.dtype)
 
@@ -1119,11 +1199,9 @@ def decoder_layer_vjp_inplace(
         use_triton_swiglu=use_triton_swiglu,
     )
     del d_y_mlp
-    # Free cached BF16 active experts immediately after MoE backward!
     saved["moe_saved"]["cached_W_gu"] = None
     saved["moe_saved"]["cached_W_dn"] = None
 
-    # Update G in-place: G_mid = G + gated_residual_vjp(d_x_mlp, d_w_mlp)
     for k0 in range(0, K_total, moe_k_chunk):
         k1 = min(k0 + moe_k_chunk, K_total)
         G[k0:k1].add_(
@@ -1132,26 +1210,30 @@ def decoder_layer_vjp_inplace(
     del d_x_mlp, d_w_mlp
 
     # ---- Stage B: Attention Injection + Token Mixer (GDN/QSA) + Attn Hyper-Connection ----
-    y_attn = saved["y_attn"]
-    w_attn = saved["w_attn"]
+    y_attn = saved["y_attn"]  # [T_v, D]
+    w_attn = saved["w_attn"]  # [T_v, hc]
     for k0 in range(0, K_total, attn_k_chunk):
         k1 = min(k0 + attn_k_chunk, K_total)
-        g4 = G[k0:k1].view(k1 - k0, T, hc, D)
+        g4 = G[k0:k1].view(k1 - k0, T_v, hc, D)
         d_y_attn = (g4 * w_attn[None, :, :, None]).sum(dim=2)
         d_w_attn = (g4.float() * y_attn.float()[None, :, None, :]).sum(dim=-1).to(G.dtype)
 
         if layer_w.layer_type == "linear_attention":
             assert layer_w.gdn is not None
-            d_x_attn = gdn_layer_vjp(d_y_attn, layer_w.gdn, saved["mixer_saved"], gdn_backend)
+            d_x_attn = gdn_layer_vjp(
+                d_y_attn, layer_w.gdn, saved["mixer_saved"], gdn_backend, bwd_start=bwd_start
+            )
         else:
             assert layer_w.qsa is not None
-            d_x_attn = qsa_layer_vjp(d_y_attn, layer_w.qsa, saved["mixer_saved"])
+            d_x_attn = qsa_layer_vjp(
+                d_y_attn, layer_w.qsa, saved["mixer_saved"], bwd_start=bwd_start
+            )
 
         G[k0:k1].add_(
             gated_residual_vjp(d_x_attn, d_w_attn, layer_w.attn_hc, saved["attn_hc_saved"])
         )
 
-    # ---- Stage C: Optional PLE Layer Backward (layer 2 only) ----
+    # ---- Stage C: Optional PLE Layer Backward (layer 2 only, already sliced to [bwd_start:]) ----
     if layer_w.ple is not None:
         ple_saved = saved["ple_saved"]
         for k0 in range(0, K_total, attn_k_chunk):
