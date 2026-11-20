@@ -178,6 +178,7 @@ def render_slice_html(
     layers = sorted(layer_top1.keys())
     rows_html = []
     for l in layers:
+        lbl = "Emb" if l == -1 else f"L{l}"
         cells = []
         for tok_str, prob in layer_top1[l]:
             alpha = min(0.85, max(0.08, prob))
@@ -186,11 +187,11 @@ def render_slice_html(
             cells.append(
                 f'<td style="background:{bg};padding:4px 6px;border:1px solid #2d333b;'
                 f'font-family:monospace;font-size:12px;white-space:nowrap;" '
-                f'title="L{l} p={prob:.3f}">{esc}<sup style="opacity:.7">{int(prob*100)}%</sup></td>'
+                f'title="{lbl} p={prob:.3f}">{esc}<sup style="opacity:.7">{int(prob*100)}%</sup></td>'
             )
         rows_html.append(
             f'<tr><th style="position:sticky;left:0;background:#161b22;color:#8b949e;padding:4px 8px;'
-            f'border:1px solid #2d333b;font-family:monospace;font-size:12px;">L{l}</th>{"".join(cells)}</tr>'
+            f'border:1px solid #2d333b;font-family:monospace;font-size:12px;">{lbl}</th>{"".join(cells)}</tr>'
         )
     # Final model output row
     m_cells = []

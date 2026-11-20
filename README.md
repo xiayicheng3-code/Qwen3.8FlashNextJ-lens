@@ -10,9 +10,10 @@ Automatically detects whichever Google Colab High-RAM runtime is randomly assign
 
 ## Key Architectural & Systems Innovations
 
-1. **Mathematically Faithful 4-Branch Gated Residual J-Lens (`J_l ∈ R^{2560 × 10240}`)**:
+1. **Mathematically Faithful 4-Branch Gated Residual J-Lens (`J_l ∈ R^{2560 × 10240}`, Layers `-1..47`)**:
    - In `Qwen3.8-Flash-Next` (`qwen4_exp`), decoder layers operate on a 4-branch hyper-connection residual stream (`H_l ∈ R^{B × T × 10240}`), collapsed to `h_final ∈ R^{B × T × 2560}` by `hyper_connection_mixer` before `lm_head` (there is no `model.norm`).
    - Computing $J_\ell = \mathbb{E}[\partial h_{\text{final}} / \partial H_\ell] \in \mathbb{R}^{2560 \times 10240}$ via reverse-mode VJP requires the **exact same `K = 2560` output cotangents** as a single-stream model while capturing all 4 branches (plus free `J_collapsed = sum_b J_l[:, b, :]` and per-branch norms).
+   - Optionally includes **embedding layer `-1`** (`INCLUDE_EMBEDDING_LAYER = True` by default in the notebook, +2.1% runtime), whose 4-branch sum $J_{\text{collapsed}}[-1] = \sum_{b=0}^{3} J_{-1}[:, b, :]$ equals the exact token-embedding Jacobian $\mathbb{E}[\partial h_{\text{final}} / \partial \mathrm{emb}] \in \mathbb{R}^{2560 \times 2560}$ (stored as `J.embed` in `.safetensors` and `J[-1]` in `.pt`).
 
 2. **Single-Sweep Layer-by-Layer Reverse Propagation (40×–120× Less PCIe/NVMe Traffic)**:
    - Naive `anthropics/jacobian-lens` (`dim_batch = 8`) runs 320 backward passes through all 48 layers per prompt -> `320 × 112.5 GiB = 36 TB` over PCIe/prompt (~24 min/prompt).

@@ -152,6 +152,7 @@ PROMPT_OFFSET = 0            #@param {type:"integer"}  # Shift start index to sh
 MAX_SEQ_LEN = 128            #@param {type:"integer"}  # Paper default: 128 tokens (keeps full K=2560 in 1 sweep!)
 SKIP_FIRST = 16              #@param {type:"integer"}  # Exclude attention-sink prefix tokens (paper default: 16)
 LAYER_STRIDE = 1             #@param {type:"integer"}  # 1 = all 48 layers (0..47); 2 = every 2nd layer
+INCLUDE_EMBEDDING_LAYER = True #@param {type:"boolean"} # Include layer -1 (embed_tokens -> H_{-1} before Layer 0; +2.1% time)
 STOP_AT_DELTA = 0.0          #@param {type:"number"}   # 0.0 = fixed N_PROMPTS; set 0.002 for Neuronpedia early stopping (after 100 prompts)
 PLE_MODE = "auto"            #@param ["auto", "mmap", "preextract"]
 
@@ -197,7 +198,7 @@ if SAVE_TO_GOOGLE_DRIVE:
     except Exception as exc:
         print(f"Google Drive mount unavailable ({exc}); saving checkpoints to local NVMe only.")
 
-TAG = f"off{PROMPT_OFFSET}_n{N_PROMPTS}_s{LAYER_STRIDE}"
+TAG = f"off{PROMPT_OFFSET}_n{N_PROMPTS}_s{LAYER_STRIDE}{'_emb' if INCLUDE_EMBEDDING_LAYER else ''}"
 CKPT_FILENAME = f"qwen38_jlens_ckpt_{TAG}.safetensors"
 CONV_FILENAME = f"qwen38_jlens_convergence_{TAG}.csv"
 
@@ -268,9 +269,13 @@ from qwen38_jlens import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", force=True)
 
-SOURCE_LAYERS = list(range(0, 48, LAYER_STRIDE))
+SOURCE_LAYERS = ([-1] if INCLUDE_EMBEDDING_LAYER else []) + list(range(0, 48, LAYER_STRIDE))
 if 47 not in SOURCE_LAYERS:
     SOURCE_LAYERS.append(47)
+print(
+    f"Source layers ({len(SOURCE_LAYERS)}): {SOURCE_LAYERS[0]}..{SOURCE_LAYERS[-1]} "
+    f"(embedding layer -1: {'ON' if INCLUDE_EMBEDDING_LAYER else 'OFF'})"
+)
 
 profile = detect_hardware(LOCAL_WORK_DIR)
 plan = build_offload_plan(
@@ -563,18 +568,19 @@ Compares **J-Lens** (`lm_head(H_l @ J_l.T)`) vs **Logit-Lens** (`lm_head(hyper_c
 from IPython.display import HTML, display
 from qwen38_jlens import render_slice_html
 
-# 1. Inspect 4-branch Gated Residual Frobenius norms across depth
+# 1. Inspect 4-branch Gated Residual Frobenius norms across depth (including Emb -1 if enabled)
 bnorms = lens.branch_norms()
 print("4-Branch Gated Residual Jacobian Norms ||J_l[:, b, :]||_F / sqrt(2560):")
-for l in [0, 8, 16, 24, 32, 40, 47]:
+for l in [-1, 0, 8, 16, 24, 32, 40, 47]:
     if l in bnorms:
+        lbl = "Emb(-1)" if l == -1 else f"L{l:02d}    "
         b_str = "  ".join(f"b{b}={v:.3f}" for b, v in enumerate(bnorms[l]))
-        print(f"  L{l:02d}: {b_str}")
+        print(f"  {lbl}: {b_str}")
 
 # 2. Multi-hop J-lens vs Logit-lens readout at final token
 test_prompt = EVAL_PROMPTS[0]
 test_ids = eval_tokenized[0]
-probe_layers = [l for l in (8, 16, 24, 32, 40, 46, 47) if l in lens.jacobians]
+probe_layers = [l for l in (-1, 8, 16, 24, 32, 40, 46, 47) if l in lens.jacobians]
 
 jl_logits, model_logits = engine.apply_lens(lens, test_ids, layers=probe_layers, positions=[-1], use_jacobian=True)
 ll_logits, _ = engine.apply_lens(lens, test_ids, layers=probe_layers, positions=[-1], use_jacobian=False)
@@ -585,12 +591,13 @@ def top5(logits_1d):
 
 print(f"\\nPrompt: {test_prompt!r}")
 for l in probe_layers:
-    print(f"  L{l:02d} Logit-Lens: {top5(ll_logits[l][0])}")
-    print(f"  L{l:02d} J-Lens    : {top5(jl_logits[l][0])}")
-print(f"  Model Output   : {top5(model_logits[0])}")
+    lbl = "Emb(-1)" if l == -1 else f"L{l:02d}    "
+    print(f"  {lbl} Logit-Lens: {top5(ll_logits[l][0])}")
+    print(f"  {lbl} J-Lens    : {top5(jl_logits[l][0])}")
+print(f"  Model Output       : {top5(model_logits[0])}")
 
-# 3. Interactive position x layer HTML slice heatmap (every 4th layer for clean viewing)
-slice_layers = [l for l in lens.source_layers if l % 4 == 0 or l == lens.source_layers[-1]]
+# 3. Interactive position x layer HTML slice heatmap (Emb -1 + every 4th layer for clean viewing)
+slice_layers = [l for l in lens.source_layers if l == -1 or l % 4 == 0 or l == lens.source_layers[-1]]
 all_jl, all_model = engine.apply_lens(lens, test_ids, layers=slice_layers, positions=None, use_jacobian=True)
 
 tok_strs = [tokenizer.decode([int(t)]) for t in test_ids[0].tolist()]

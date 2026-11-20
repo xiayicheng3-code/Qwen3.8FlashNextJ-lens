@@ -26,30 +26,38 @@ from tests.test_ple_and_loader import _make_synthetic_fp8_checkpoint
 
 def test_safetensors_checkpoint_roundtrip_and_direct_lens_load(tmp_path: Path):
     torch.manual_seed(10)
-    j_mean = {0: torch.randn(16, 64), 1: torch.randn(16, 64)}
+    j_mean = {-1: torch.randn(16, 64), 0: torch.randn(16, 64), 1: torch.randn(16, 64)}
     ckpt = str(tmp_path / "ckpt.safetensors")
 
     save_jlens_safetensors(
         ckpt, j_mean, n_done=37, next_idx=40, skip_first=16, d_model=16, hc_count=4, dtype=torch.float16
     )
 
+    from safetensors import safe_open
+    with safe_open(ckpt, framework="pt", device="cpu") as sf:
+        assert "J.embed" in sf.keys()
+        assert "J.layer_00" in sf.keys()
+
     meta = peek_checkpoint_metadata(ckpt)
     assert meta is not None
     assert meta["n_done"] == 37
     assert meta["next_idx"] == 40
-    assert meta["source_layers"] == [0, 1]
+    assert meta["source_layers"] == [-1, 0, 1]
     assert meta["ckpt_dtype"] == "float16"
 
     # Any in-progress checkpoint is IMMEDIATELY loadable as a usable Qwen38JacobianLens!
     lens = Qwen38JacobianLens.load(ckpt)
     assert lens.n_prompts == 37
+    assert lens.source_layers == [-1, 0, 1]
     assert lens.d_model == 16 and lens.hc_count == 4
+    assert torch.allclose(lens.jacobians[-1], j_mean[-1], atol=2e-3)
     assert torch.allclose(lens.jacobians[0], j_mean[0], atol=2e-3)
 
     # Also test Qwen38JacobianLens.save() -> .safetensors with collapsed J
     out_st = str(tmp_path / "final.safetensors")
     lens.save(out_st, dtype=torch.float16, include_collapsed=True)
     reloaded = Qwen38JacobianLens.load(out_st)
+    assert reloaded.source_layers == [-1, 0, 1]
     assert torch.allclose(reloaded.jacobians[1], lens.jacobians[1], atol=1e-4)
 
 
@@ -122,12 +130,16 @@ def test_engine_fit_async_checkpoint_resume_csv_and_keyboard_interrupt(tmp_path:
             raise KeyboardInterrupt("Simulated Colab stop")
 
     with pytest.raises(KeyboardInterrupt):
-        engine.fit(prompts, skip_first=2, checkpoint_manager=mgr1, resume=False, on_prompt_done=_interrupt_after_two)
+        engine.fit(
+            prompts, include_embedding_layer=True, skip_first=2,
+            checkpoint_manager=mgr1, resume=False, on_prompt_done=_interrupt_after_two,
+        )
     mgr1.close()
 
     # Verify BOTH Drive checkpoint AND Drive convergence CSV were safely flushed on KeyboardInterrupt!
     meta_drive = peek_checkpoint_metadata(drive_ckpt)
     assert meta_drive is not None and meta_drive["n_done"] == 2 and meta_drive["next_idx"] == 2
+    assert meta_drive["source_layers"] == [-1, 0, 1]
     assert os.path.isfile(drive_csv)
 
     # Delete local NVMe checkpoint + CSV (simulating brand-new Colab VM!) -> auto-resume from Drive!
@@ -144,17 +156,18 @@ def test_engine_fit_async_checkpoint_resume_csv_and_keyboard_interrupt(tmp_path:
             every_minutes=0.0,
         )
     )
-    lens_resumed = engine.fit(prompts, skip_first=2, checkpoint_manager=mgr2, resume=True)
+    lens_resumed = engine.fit(prompts, include_embedding_layer=True, skip_first=2, checkpoint_manager=mgr2, resume=True)
     mgr2.close()
     assert lens_resumed.n_prompts == 4
+    assert lens_resumed.source_layers == [-1, 0, 1]
 
     # Verify unbroken 4-row convergence CSV across the disconnect (header + 4 rows, no duplicates!)
     rows = Path(drive_csv).read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == 5  # header + prompts 0, 1, 2, 3
 
     # Compare against uninterrupted reference fit
-    lens_ref = engine.fit(prompts, skip_first=2, resume=False)
-    for l in (0, 1):
+    lens_ref = engine.fit(prompts, include_embedding_layer=True, skip_first=2, resume=False)
+    for l in (-1, 0, 1):
         assert torch.allclose(lens_resumed.jacobians[l], lens_ref.jacobians[l], atol=1e-5)
 
     # Test early stopping (`stop_at_delta`) with identical prompts so delta drops immediately below threshold
@@ -180,18 +193,22 @@ def test_engine_fit_async_checkpoint_resume_csv_and_keyboard_interrupt(tmp_path:
     pt_data = torch.load(written["neuronpedia_pt"], map_location="cpu", weights_only=True)
     assert pt_data["n_prompts"] == 4
     assert pt_data["d_model"] == 16
-    assert pt_data["source_layers"] == [0, 1]
+    assert pt_data["source_layers"] == [-1, 0, 1]
+    assert pt_data["J"][-1].shape == (16, 16)
     assert pt_data["J"][0].shape == (16, 16)
-    assert pt_data["J"][0].dtype == torch.float16
+    assert pt_data["J"][-1].dtype == torch.float16
     assert pt_data["provenance"]["author"] == "Test Author"
+    assert pt_data["provenance"]["include_embedding_layer"] is True
     assert pt_data["provenance"]["hc_count"] == 4
 
     reloaded_4b = Qwen38JacobianLens.load(written["full_4branch_safetensors"])
-    assert reloaded_4b.jacobians[0].shape == (16, 64)
-    assert torch.allclose(reloaded_4b.collapsed_jacobians()[0], pt_data["J"][0].float(), atol=1e-3)
+    assert reloaded_4b.source_layers == [-1, 0, 1]
+    assert reloaded_4b.jacobians[-1].shape == (16, 64)
+    assert torch.allclose(reloaded_4b.collapsed_jacobians()[-1], pt_data["J"][-1].float(), atol=1e-3)
 
     cfg_text = Path(written["config_yaml"]).read_text(encoding="utf-8")
     assert 'np_model_id: "qwen3.8-flash-next"' in cfg_text
+    assert "include_embedding_layer: true" in cfg_text
     assert "prompts_fitted: 4" in cfg_text
     assert 'author: "Test Author"' in cfg_text
 

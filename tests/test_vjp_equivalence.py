@@ -513,27 +513,22 @@ def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     engine = Qwen38JLensEngine(loaded)
     input_ids = torch.randint(0, V - 2, (1, T))
 
-    # Fast single-sweep engine Jacobian
-    J_fast, seq_len, n_valid, _, _ = engine.jacobian_for_tokens(input_ids, source_layers=[0, 1, 2, 3], skip_first=skip_first)
+    # Fast single-sweep engine Jacobian (including embedding layer -1!)
+    src_layers = [-1, 0, 1, 2, 3]
+    J_fast, seq_len, n_valid, _, _ = engine.jacobian_for_tokens(input_ids, source_layers=src_layers, skip_first=skip_first)
     assert seq_len == T and n_valid == T - skip_first - 1
 
-    # Reference Anthropic jlens estimator via full PyTorch autograd
+    # Reference Anthropic jlens estimator via full PyTorch autograd starting from embed_tokens!
     cos, sin = build_rope_cos_sin(T, 8, 0.25, cfg.rope_theta, torch.device("cpu"), torch.float32)
     ple_emb = ple_provider.lookup(input_ids, device="cpu").float()
     valid_pos = valid_position_mask(T, skip_first=skip_first).nonzero(as_tuple=True)[0]
 
-    H = F.embedding(input_ids, embed_tokens).repeat(1, 1, hc)
-    # Run layer 0 -> H_0 (root of autograd graph!)
-    H0 = H
-    xm, wm = _ref_gated_residual(H0, layers[0].attn_hc)
-    H0 = H0 + (_ref_gdn(xm, layers[0].gdn).unsqueeze(-2) * wm.unsqueeze(-1)).flatten(-2)
-    xm, wm = _ref_gated_residual(H0, layers[0].mlp_hc)
-    H0 = (H0 + (_ref_moe(xm, layers[0].moe_dense, moe_store[0]).unsqueeze(-2) * wm.unsqueeze(-1)).flatten(-2)).detach()
-
-    H0_rep = H0.expand(D, -1, -1).clone().requires_grad_(True)
-    acts = [H0_rep]
-    cur = H0_rep
-    for l in range(1, 4):
+    emb_rep = F.embedding(input_ids, embed_tokens).expand(D, -1, -1).clone().requires_grad_(True)
+    H_emb_rep = emb_rep.repeat(1, 1, hc)
+    H_emb_rep.retain_grad()
+    acts = [H_emb_rep]
+    cur = H_emb_rep
+    for l in range(4):
         if layers[l].ple is not None:
             cur = cur + _ref_ple(cur, ple_emb.expand(D, -1, -1), layers[l].ple)
         xm, wm = _ref_gated_residual(cur, layers[l].attn_hc)
@@ -547,18 +542,30 @@ def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     cot = torch.zeros_like(h_final)
     idx = torch.arange(D)
     cot[idx[:, None], valid_pos[None, :], idx[:, None]] = 1.0
-    grads = torch.autograd.grad(h_final, acts, grad_outputs=cot)
+    grads = torch.autograd.grad(h_final, acts, grad_outputs=cot, retain_graph=True)
+    (g_emb_ref,) = torch.autograd.grad(h_final, emb_rep, grad_outputs=cot)
 
-    for l, g_ref in enumerate(grads):
+    for l, g_ref in zip(src_layers, grads, strict=True):
         J_ref_l = g_ref[:, valid_pos, :].mean(dim=1)
         max_diff = (J_fast[l] - J_ref_l).abs().max().item()
         assert torch.allclose(J_fast[l], J_ref_l, atol=1e-4), f"Layer {l} mismatch: max_diff={max_diff}"
 
-    # Verify apply_lens runs cleanly for both J-lens and logit-lens baseline
-    lens = engine.fit([input_ids, input_ids], source_layers=[0, 1, 2, 3], skip_first=skip_first)
+    # Collapsed embedding Jacobian sum_{b=0..3} J_{-1}[:, b, :] must match exact d h_final / d emb!
+    J_emb_collapsed = J_fast[-1].view(D, hc, D).sum(dim=1)
+    J_emb_ref = g_emb_ref[:, valid_pos, :].mean(dim=1)
+    assert torch.allclose(J_emb_collapsed, J_emb_ref, atol=1e-4)
+
+    # Verify fit(include_embedding_layer=True) & apply_lens work seamlessly for layer -1..3
+    lens = engine.fit([input_ids, input_ids], include_embedding_layer=True, skip_first=skip_first)
+    assert lens.source_layers == [-1, 0, 1, 2, 3]
     jl_logits, m_logits = engine.apply_lens(lens, input_ids, positions=[-2], use_jacobian=True)
     ll_logits, _ = engine.apply_lens(lens, input_ids, positions=[-2], use_jacobian=False)
     assert m_logits.shape == (1, V)
-    assert set(jl_logits.keys()) == {0, 1, 2, 3}
-    assert set(ll_logits.keys()) == {0, 1, 2, 3}
+    assert set(jl_logits.keys()) == {-1, 0, 1, 2, 3}
+    assert set(ll_logits.keys()) == {-1, 0, 1, 2, 3}
+
+    # Verify 4-branch transport on H_{-1} equals single-stream collapsed readout on emb!
+    emb_pos = F.embedding(input_ids[:, -2:-1], embed_tokens)[0]  # [1, D]
+    expected_emb_logits = F.linear(F.linear(emb_pos.float(), lens.collapsed_jacobians()[-1]), lm_head.float())
+    assert torch.allclose(jl_logits[-1], expected_emb_logits, atol=1e-4)
     engine.close()

@@ -307,10 +307,17 @@ class Qwen38JLensEngine:
         *,
         capture_layers: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
-        """Run ONE fast `B=1` forward pass streaming layers 0..L-1; returns `(h_final, captured_H)`."""
+        """Run ONE fast `B=1` forward pass streaming layers 0..L-1; returns `(h_final, captured_H)`.
+
+        Layer `-1` denotes the post-embedding 4-branch state `H_{-1} = emb.repeat(1, 1, hc_count)` before Layer 0.
+        """
         input_ids = input_ids.to(self.device)
         T = input_ids.shape[1]
-        capture_set = set(range(self.cfg.num_hidden_layers)) if capture_layers is None else set(capture_layers)
+        capture_set = (
+            {-1, *range(self.cfg.num_hidden_layers)}
+            if capture_layers is None
+            else set(capture_layers)
+        )
 
         cos, sin = build_rope_cos_sin(
             seq_len=T,
@@ -325,6 +332,8 @@ class Qwen38JLensEngine:
         emb = F.embedding(input_ids, self.model.embed_tokens)  # [1, T, D]
         H = emb.repeat(1, 1, self.cfg.hc_count).contiguous()   # [1, T, hc_count * D]
         captured: dict[int, torch.Tensor] = {}
+        if -1 in capture_set:
+            captured[-1] = H.detach()
 
         for l_idx, experts in self.streamer.iter_sweep(range(self.cfg.num_hidden_layers)):
             H, _ = decoder_layer_fwd(
@@ -355,6 +364,10 @@ class Qwen38JLensEngine:
     ) -> tuple[dict[int, torch.Tensor], int, int, float, float]:
         """Compute exact per-prompt `J_l = E[d h_final / d H_l]` (`[D, hc_count * D]` fp32 CPU) for all `source_layers`.
 
+        Layer `-1` (optional) represents the embedding output `H_{-1} = emb.repeat(1, 1, hc_count)` before Layer 0,
+        whose 4-branch sum `J_collapsed[-1] = sum_b J_{-1}[:, b, :]` equals the exact token-embedding Jacobian
+        `E[d h_final / d emb]`.
+
         Uses single-sweep layer-by-layer reverse propagation:
           - Forward sweep (0 -> L-1): saves ONLY `[1, T, 10240]` layer inputs (~120 MB total!).
           - Backward sweep (L-1 -> min_source + 1): holds ALL `k_pass` cotangents in ONE in-place
@@ -372,7 +385,9 @@ class Qwen38JLensEngine:
         hc = self.cfg.hc_count
         D_hc = D * hc
         n_layers = self.cfg.num_hidden_layers
-        src_list = sorted(set(source_layers))
+        src_list = sorted(set(int(l) for l in source_layers))
+        if not src_list or src_list[0] < -1 or src_list[-1] >= n_layers:
+            raise ValueError(f"source_layers {src_list} out of valid range [-1, {n_layers - 1}]")
         src_set = set(src_list)
         min_src = src_list[0]
 
@@ -498,6 +513,7 @@ class Qwen38JLensEngine:
         tokenized_prompts: Sequence[torch.Tensor],
         *,
         source_layers: Sequence[int] | None = None,
+        include_embedding_layer: bool = False,
         skip_first: int = SKIP_FIRST_N_POSITIONS,
         checkpoint_path: str | None = None,
         checkpoint_every: int = 10,
@@ -512,6 +528,8 @@ class Qwen38JLensEngine:
         """Fit `J_l` over tokenized prompts `[1, T]` with zero-GPU-stall async checkpointing & resume.
 
         Supports:
+          - `include_embedding_layer=True` (or `-1` in `source_layers`) to include layer `-1`
+            (`embed_tokens -> H_{-1}` before Layer 0, where `J_collapsed[-1] = d h_final / d emb`).
           - `checkpoint_manager=AsyncCheckpointManager(...)` (recommended: Local NVMe + async Google Drive
             during fitting, plus one-shot `publish_bundle_to_hf(...)` once complete!), OR
           - `checkpoint_path=".../ckpt.safetensors"` (or legacy `.pt`) for simple local checkpointing.
@@ -523,7 +541,12 @@ class Qwen38JLensEngine:
         n_layers = self.cfg.num_hidden_layers
         D = self.cfg.hidden_size
         D_hc = D * self.cfg.hc_count
-        src_layers = list(range(n_layers)) if source_layers is None else sorted(set(source_layers))
+        if source_layers is None:
+            src_layers = ([-1] if include_embedding_layer else []) + list(range(n_layers))
+        else:
+            src_layers = sorted(set(int(l) for l in source_layers))
+            if include_embedding_layer and -1 not in src_layers:
+                src_layers = [-1] + src_layers
 
         owned_mgr = False
         mgr: AsyncCheckpointManager | None = checkpoint_manager

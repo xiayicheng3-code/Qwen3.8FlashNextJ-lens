@@ -104,6 +104,10 @@ def peek_checkpoint_metadata(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _layer_tensor_key(prefix: str, layer: int) -> str:
+    return f"{prefix}.embed" if int(layer) == -1 else f"{prefix}.layer_{int(layer):02d}"
+
+
 def save_jlens_safetensors(
     path: str,
     jacobian_mean: dict[int, torch.Tensor],
@@ -138,9 +142,9 @@ def save_jlens_safetensors(
         J_f = (raw.float() * inv_div) if divisor != 1.0 else raw.float()
         J4 = J_f.view(d_model, hc_count, d_model)
         branch_norms[str(l)] = [round(float(J4[:, b, :].norm().item() / scale), 5) for b in range(hc_count)]
-        tensors[f"J.layer_{l:02d}"] = J_f.to(dtype=dtype).contiguous()
+        tensors[_layer_tensor_key("J", l)] = J_f.to(dtype=dtype).contiguous()
         if include_collapsed:
-            tensors[f"J_collapsed.layer_{l:02d}"] = J4.sum(dim=1).to(dtype=dtype).contiguous()
+            tensors[_layer_tensor_key("J_collapsed", l)] = J4.sum(dim=1).to(dtype=dtype).contiguous()
         del J_f, J4
 
     metadata = {
@@ -167,11 +171,15 @@ def load_jlens_safetensors(path: str) -> tuple[dict[int, torch.Tensor], dict[str
     """Load `jacobian_mean` (`{layer: fp32 CPU Tensor}`) and metadata from a `.safetensors` file."""
     with safe_open(path, framework="pt", device="cpu") as sf:
         raw_meta = sf.metadata() or {}
+        avail_keys = set(sf.keys())
         source_layers = json.loads(raw_meta["source_layers"])
         jacobian_mean: dict[int, torch.Tensor] = {}
         for l in source_layers:
-            key = f"J.layer_{int(l):02d}"
-            jacobian_mean[int(l)] = sf.get_tensor(key).float()
+            li = int(l)
+            key = _layer_tensor_key("J", li)
+            if key not in avail_keys:
+                key = f"J.layer_{li:02d}"
+            jacobian_mean[li] = sf.get_tensor(key).float()
 
     meta = {
         "n_done": int(raw_meta["n_done"]),
@@ -645,11 +653,13 @@ def export_neuronpedia_bundle(
 
     # 2. Neuronpedia-compatible fp16 `.pt` (`J[l]: [d_model, d_model]`, weights_only=True safe!)
     collapsed = lens.collapsed_jacobians()
+    has_embed_layer = -1 in lens.source_layers
     provenance = {
         "source_model": hf_model_name,
         "np_model_id": np_model_id,
         "method": "jacobian_lens",
-        "capture_point": "decoder_layer_output",
+        "capture_point": "embed_tokens_and_decoder_layer_output" if has_embed_layer else "decoder_layer_output",
+        "include_embedding_layer": has_embed_layer,
         "stream_reduce": "equal_perturbation_sum_over_4_gr_branches",
         "hc_count": int(lens.hc_count),
         "full_4branch_file": st_filename if include_4branch_safetensors else None,
@@ -714,6 +724,7 @@ def export_neuronpedia_bundle(
         f"  d_model: {int(lens.d_model)}",
         f"  hc_count: {int(lens.hc_count)}",
         f"  d_source_4branch: {int(lens.d_source)}",
+        f"  include_embedding_layer: {_yaml_scalar(has_embed_layer)}",
         f"  n_source_layers: {len(lens.source_layers)}",
         f"  source_layers: {json.dumps([int(l) for l in lens.source_layers])}",
         "  target_layer: null",
@@ -749,19 +760,25 @@ def export_neuronpedia_bundle(
 
     # 5. Contributor `CREDIT.md`
     author_label = author.strip() if author else "Community contributor"
+    emb_note = (
+        "\n- **Embedding Layer (`-1`)**: Included (`J[-1]` in `.pt` equals the exact token-embedding Jacobian "
+        "`E[d h_final / d emb] = sum_{b=0..3} J_{-1}[:, b, :]`; stored as `J.embed` in `.safetensors`)."
+        if has_embed_layer
+        else ""
+    )
     credit_md = f"""# Qwen3.8-Flash-Next Jacobian Lens
 
 - **Model**: `{hf_model_name}` (`qwen4_exp`, 48 layers, 4-branch Gated Residual `hc_count=4`, `d_model=2560`, 51B PLE n-gram table at layer 2)
 - **Fitted by**: {author_label}
 - **Prompts**: {lens.n_prompts} (`{dataset_name}` / `{dataset_config}`, `max_seq_len={max_seq_len}`, `skip_first={skip_first}`)
-- **Method**: Exact Jacobian Lens (`J_l = E[d h_final / d H_l]`, Gurnee et al., 2026)
+- **Method**: Exact Jacobian Lens (`J_l = E[d h_final / d H_l]`, Gurnee et al., 2026){emb_note}
 
 ## Files
 
 | File | Shape / Format | Purpose |
 |---|---|---|
 | `{pt_filename}` | `J[l]: [2560, 2560]` (`fp16` `.pt`, `weights_only=True`) | Drop-in Neuronpedia readout (`unembed(h @ J[l].T)` where `h` is the mean/equal-perturbation residual across the 4 Gated Residual streams: `J_collapsed = sum_{{b=0..3}} J_4branch[:, b, :]`). |
-| `{st_filename}` | `J.layer_XX: [2560, 10240]` + `J_collapsed.layer_XX: [2560, 2560]` (`fp16` `.safetensors`) | Full lossless 4-branch Jacobian (`unembed(H_l @ J_l.T)` where `H_l` is the concatenated `[4 * 2560]` Gated Residual state). |
+| `{st_filename}` | `J.layer_XX` / `J.embed`: `[2560, 10240]` + `J_collapsed.*`: `[2560, 2560]` (`fp16` `.safetensors`) | Full lossless 4-branch Jacobian (`unembed(H_l @ J_l.T)` where `H_l` is the concatenated `[4 * 2560]` Gated Residual state). |
 | `config.yaml` | YAML | Reproducible fitting configuration, hardware, kernel stack, and convergence summary. |
 | `{csv_filename}` | CSV | Per-prompt convergence log (`mean_rel_change`, `max_norm`, wall-clock timing). |
 """
