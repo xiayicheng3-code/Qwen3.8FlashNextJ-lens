@@ -151,6 +151,7 @@ N_PROMPTS = 100              #@param {type:"integer"}  # 100 = usable lens; 1000
 PROMPT_OFFSET = 0            #@param {type:"integer"}  # Shift start index to shard across parallel Colab sessions & merge()
 MAX_SEQ_LEN = 128            #@param {type:"integer"}  # Paper default: 128 tokens (keeps full K=2560 in 1 sweep!)
 SKIP_FIRST = 16              #@param {type:"integer"}  # Exclude attention-sink prefix tokens (paper default: 16)
+BOS_PREFIX = "none"          #@param ["none", "endoftext"]  # "none" = exact jlens/Neuronpedia parity; "endoftext" = 1x <|endoftext|> (248044)
 LAYER_STRIDE = 1             #@param {type:"integer"}  # 1 = all 48 layers (0..47); 2 = every 2nd layer
 INCLUDE_EMBEDDING_LAYER = True #@param {type:"boolean"} # Include layer -1 (embed_tokens -> H_{-1} before Layer 0; +2.1% time)
 STOP_AT_DELTA = 0.0          #@param {type:"number"}   # 0.0 = fixed N_PROMPTS; set 0.002 for Neuronpedia early stopping (after 100 prompts)
@@ -349,7 +350,7 @@ torch.cuda.empty_cache()
     cells.append(
         new_markdown_cell(
             """## 5. Load Tokenizer & Pretraining-Like Fitting Corpus (`Salesforce/wikitext`)
-Matches `anthropics/jacobian-lens`: streams `Salesforce/wikitext` (`wikitext-103-raw-v1`, `min_chars=600`), truncates to `MAX_SEQ_LEN=128` tokens, and prepends BOS when missing."""
+Matches `anthropics/jacobian-lens`: streams `Salesforce/wikitext` (`wikitext-103-raw-v1`, `min_chars=600`) and truncates to `MAX_SEQ_LEN=128` tokens (`BOS_PREFIX="none"` uses `tokenizer(..., add_special_tokens=True)` directly with no synthetic `<|im_end|>`, letting positions `0..SKIP_FIRST-1` absorb the attention sink before masking)."""
         )
     )
     cells.append(
@@ -359,13 +360,22 @@ from transformers import AutoTokenizer
 import torch
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN, trust_remote_code=False)
+_EOT_ID = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+if _EOT_ID is None or _EOT_ID == tokenizer.unk_token_id:
+    _EOT_ID = 248044  # Qwen3.8 text_config.eos_token_id (pretraining boundary & PLE n-gram cut)
 
 def encode_prompt(text: str, max_len: int = MAX_SEQ_LEN) -> torch.Tensor:
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
-    if bos_id is not None and (not ids or ids[0] != bos_id):
-        ids = [bos_id] + ids
-    ids = ids[:max_len]
+    if BOS_PREFIX == "none":
+        # Exact anthropics/jacobian-lens (jlens/hf.py) behavior: no synthetic BOS prepended
+        # when tokenizer.bos_token is null; positions 0..SKIP_FIRST-1 absorb the sink and are masked out.
+        ids = tokenizer(text, add_special_tokens=True, truncation=True, max_length=max_len)["input_ids"]
+    elif BOS_PREFIX == "endoftext":
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if not ids or ids[0] != _EOT_ID:
+            ids = [_EOT_ID] + ids
+        ids = ids[:max_len]
+    else:
+        raise ValueError(f"Unsupported BOS_PREFIX={BOS_PREFIX!r}")
     return torch.tensor([ids], dtype=torch.long)
 
 def load_wikitext_slice(offset: int, n_prompts: int, min_chars: int = 600) -> list[str]:
@@ -393,8 +403,9 @@ EVAL_PROMPTS = [
 eval_tokenized = [encode_prompt(p, max_len=256) for p in EVAL_PROMPTS]
 
 lengths = [int(t.shape[1]) for t in tokenized_prompts]
-print(f"Prepared {len(tokenized_prompts)} WikiText prompts (offset={PROMPT_OFFSET}): "
-      f"min_len={min(lengths)}, median={sorted(lengths)[len(lengths)//2]}, max_len={max(lengths)}")
+first_tok = tokenizer.decode([int(tokenized_prompts[0][0, 0])]) if tokenized_prompts else ""
+print(f"Prepared {len(tokenized_prompts)} WikiText prompts (offset={PROMPT_OFFSET}, bos_prefix={BOS_PREFIX!r}, skip_first={SKIP_FIRST}): "
+      f"min_len={min(lengths)}, median={sorted(lengths)[len(lengths)//2]}, max_len={max(lengths)}, tok0={first_tok!r}")
 """
         )
     )
