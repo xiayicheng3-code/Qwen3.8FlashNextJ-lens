@@ -46,7 +46,7 @@ def build_notebook() -> nbformat.NotebookNode:
 ### Core Breakthroughs in This Notebook
 | Optimization | Impact |
 |---|---|
-| **Single-Sweep Layer-by-Layer Reverse Propagation + 16-Aligned Causal Suffix Pruning** | Forward runs ONCE at `B = 1` on `[0:T]` (~120 MB saved inputs). Backward exploits block lower-triangular causality to prune masked prefix tokens `[0 : bwd_start]` (`T_v = 112` at `T = 128, skip_first = 16`), holding ALL `K = 2560` cotangents in ONE in-place GPU buffer (`5.47 GiB`, `+0.78 GiB` VRAM headroom) while preserving 128-wide MoE/projection/FlashQLA tiling and computing all `2560` VJPs of layer `l` **before** moving to layer `l-1` -> **1× weight sweep/prompt** (40×–120× less PCIe/NVMe traffic!). |
+| **Single-Sweep Layer-by-Layer Reverse Propagation + 16-Aligned Causal Suffix Pruning** | Forward runs ONCE per micro-batch of `FWD_BATCH_SIZE = 8` prompts (caching ~120 MB/prompt in CPU RAM -> **0 GiB extra VRAM, 8× fewer forward weight sweeps**!). Backward exploits block lower-triangular causality to prune masked prefix tokens `[0 : bwd_start]` (`T_v = 112` at `T = 128, skip_first = 16`), holding ALL `K = 2560` cotangents in ONE in-place GPU buffer (`5.47 GiB`, `+0.78 GiB` VRAM headroom) while preserving 128-wide MoE/projection/FlashQLA tiling and computing all `2560` VJPs of layer `l` **before** moving to layer `l-1` -> **1× backward weight sweep/prompt** (40×–120× less PCIe/NVMe traffic!). |
 | **Fused Active-Expert MoE VJP (`grouped_mm` + Triton)** | Each layer dequantizes ONLY hit experts **ONCE** via a custom 128×128 Triton FP8 kernel (~2.5 ms), runs Tensor-Core-saturated CUTLASS/cuBLAS `grouped_mm` across `n_e × K_blk` rows, fuses SwiGLU backward in Triton, and includes the exact top-k softmax router VJP without materializing `[T, K, 512]`. |
 | **Zero-RAM 51B PLE Mmap / Pre-Extraction** | `MADV_RANDOM` mmap directly on PLE safetensors shards (`0 GiB` VRAM, `0 GiB` pinned RAM, `< 2 ms`/prompt), with automatic two-stage pre-extraction (`~64 MB`) if disk is tight. |
 | **Interleaved 3-Tier Async Double-Buffering** | Permanently pins dense BF16 (`8.2 GiB`) + max MoE layers in **Tier 0 GPU HBM**, spills to **Tier 1 Pinned/Pageable RAM**, and (on A100 40G) interleaves **Tier 2 contiguous NVMe slabs** every ~2.4 layers so background NVMe preads & H2D DMAs hide **100% behind backward compute**! |
@@ -151,6 +151,7 @@ N_PROMPTS = 100              #@param {type:"integer"}  # 100 = usable lens; 1000
 PROMPT_OFFSET = 0            #@param {type:"integer"}  # Shift start index to shard across parallel Colab sessions & merge()
 MAX_SEQ_LEN = 128            #@param {type:"integer"}  # Paper default: 128 tokens (keeps full K=2560 in 1 sweep!)
 SKIP_FIRST = 16              #@param {type:"integer"}  # Exclude attention-sink prefix tokens (paper default: 16)
+FWD_BATCH_SIZE = 8           #@param {type:"integer"}  # Zero-VRAM forward-only micro-batching (8x fewer forward weight sweeps!)
 BOS_PREFIX = "none"          #@param ["none", "endoftext"]  # "none" = exact jlens/Neuronpedia parity; "endoftext" = 1x <|endoftext|> (248044)
 LAYER_STRIDE = 1             #@param {type:"integer"}  # 1 = all 48 layers (0..47); 2 = every 2nd layer
 INCLUDE_EMBEDDING_LAYER = True #@param {type:"boolean"} # Include layer -1 (embed_tokens -> H_{-1} before Layer 0; +2.1% time)
@@ -518,6 +519,7 @@ try:
         tokenized_prompts,
         source_layers=SOURCE_LAYERS,
         skip_first=SKIP_FIRST,
+        fwd_batch_size=FWD_BATCH_SIZE,
         checkpoint_manager=ckpt_mgr,
         stop_at_delta=(STOP_AT_DELTA if STOP_AT_DELTA > 0 else None),
         min_prompts=100,

@@ -299,6 +299,31 @@ class FitStats:
     mean_rel_change: float
 
 
+@dataclass
+class _CachedPromptForward:
+    """Compact per-prompt forward cache (~120 MB in CPU RAM at T=128) for forward-only micro-batching."""
+
+    seq_len: int
+    n_valid: int
+    bwd_start: int
+    valid_pos_local: torch.Tensor
+    layer_inputs: dict[int, torch.Tensor]
+    mixer_saved_v: dict[str, Any]
+    ple_embs: dict[int, torch.Tensor]
+
+
+def _move_tensor_dict(d: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    non_blocking = device.type == "cuda"
+    return {
+        k: (
+            v.to(device, non_blocking=non_blocking)
+            if isinstance(v, torch.Tensor) and v.device != device
+            else v
+        )
+        for k, v in d.items()
+    }
+
+
 class Qwen38JLensEngine:
     """High-performance single-sweep Jacobian Lens fitter and inference applier for Qwen3.8-Flash-Next."""
 
@@ -314,11 +339,17 @@ class Qwen38JLensEngine:
     def close(self) -> None:
         self.streamer.close()
 
-    def _get_ple_embeddings(self, input_ids: torch.Tensor) -> dict[int, torch.Tensor]:
-        """Gather `B=1` PLE n-gram embeddings on GPU for all PLE layers (takes <2 ms via mmap)."""
+    def _get_ple_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        device: torch.device | None = None,
+    ) -> dict[int, torch.Tensor]:
+        """Gather `B=1` PLE n-gram embeddings for all PLE layers (takes <2 ms via mmap)."""
+        target_dev = self.device if device is None else device
         out: dict[int, torch.Tensor] = {}
         for l_idx, provider in self.model.ple_providers.items():
-            out[l_idx] = provider.lookup(input_ids, device=self.device).to(self.dtype)
+            out[l_idx] = provider.lookup(input_ids, device=target_dev).to(self.dtype)
         return out
 
     @torch.no_grad()
@@ -376,44 +407,128 @@ class Qwen38JLensEngine:
         return h_final, captured
 
     @torch.no_grad()
-    def jacobian_for_tokens(
+    def _forward_microbatch(
         self,
-        input_ids: torch.Tensor,  # [1, T]
-        source_layers: Sequence[int],
+        batch_input_ids: Sequence[torch.Tensor],
+        min_src: int,
         *,
         skip_first: int = SKIP_FIRST_N_POSITIONS,
         bwd_align: int = 16,
-    ) -> tuple[dict[int, torch.Tensor], int, int, float, float]:
-        """Compute exact per-prompt `J_l = E[d h_final / d H_l]` (`[D, hc_count * D]` fp32 CPU) for all `source_layers`.
+        cache_on_cpu: bool = False,
+    ) -> tuple[list[_CachedPromptForward], float]:
+        """Run ONE forward weight sweep (0 -> L-1) amortized across `len(batch_input_ids)` prompts.
 
-        Layer `-1` (optional) represents the embedding output `H_{-1} = emb.repeat(1, 1, hc_count)` before Layer 0,
-        whose 4-branch sum `J_collapsed[-1] = sum_b J_{-1}[:, b, :]` equals the exact token-embedding Jacobian
-        `E[d h_final / d emb]`.
-
-        Uses single-sweep layer-by-layer reverse propagation with 16-aligned exact causal suffix pruning:
-          - Forward sweep (0 -> L-1): runs on full `[0:T]`, saving ONLY `[1, T, 10240]` layer inputs (~120 MB total!).
-          - Backward sweep (L-1 -> min_source + 1): drops masked prefix tokens `[0 : bwd_start]` while keeping
-            `T_v = T - bwd_start` aligned to `bwd_align` (e.g. `112` at `T=128, skip_first=16`), holds ALL `k_pass`
-            cotangents in ONE in-place GPU buffer `G [k_pass, T_v, 10240]` (5.47 GiB vs 6.25 GiB), dequantizes
-            only suffix-hit experts ONCE, and overlaps next-layer DMA/NVMe prefetch 100% behind backward compute!
+        Supports variable-length prompts without padding. When `cache_on_cpu=True` (used for
+        `fwd_batch_size > 1` on CUDA), stores each prompt's `[1, T, D_hc]` layer inputs (~120 MB/prompt)
+        in CPU RAM so peak GPU VRAM stays identical to `fwd_batch_size=1` (0 GiB VRAM overhead!).
         """
         t0 = time.perf_counter()
-        input_ids = input_ids.to(self.device)
-        T = int(input_ids.shape[1])
-        pos_mask = valid_position_mask(T, skip_first=skip_first)
-        valid_pos = pos_mask.nonzero(as_tuple=True)[0].to(self.device)
-        n_valid = int(valid_pos.numel())
-        bwd_start = compute_aligned_bwd_start(T, skip_first, align=bwd_align)
+        B = len(batch_input_ids)
+        hc = self.cfg.hc_count
+        n_layers = self.cfg.num_hidden_layers
+        offload_to_cpu = cache_on_cpu and self.device.type != "cpu"
+        ple_dev = torch.device("cpu") if offload_to_cpu else self.device
+
+        seq_lens: list[int] = []
+        n_valids: list[int] = []
+        bwd_starts: list[int] = []
+        valid_pos_locals: list[torch.Tensor] = []
+        rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        ple_embs_list: list[dict[int, torch.Tensor]] = []
+        H_cur: list[torch.Tensor] = []
+
+        for ids in batch_input_ids:
+            T = int(ids.shape[1])
+            pos_mask = valid_position_mask(T, skip_first=skip_first)
+            valid_pos = pos_mask.nonzero(as_tuple=True)[0]
+            bwd_start = compute_aligned_bwd_start(T, skip_first, align=bwd_align)
+            seq_lens.append(T)
+            n_valids.append(int(valid_pos.numel()))
+            bwd_starts.append(bwd_start)
+            valid_pos_locals.append(valid_pos - bwd_start)
+
+            if T not in rope_cache:
+                rope_cache[T] = build_rope_cos_sin(
+                    seq_len=T,
+                    head_dim=self.cfg.head_dim,
+                    partial_rotary_factor=self.cfg.partial_rotary_factor,
+                    rope_theta=self.cfg.rope_theta,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            ids_dev = ids.to(self.device)
+            ple_embs_list.append(self._get_ple_embeddings(ids_dev, device=ple_dev))
+            emb = F.embedding(ids_dev, self.model.embed_tokens)
+            H_cur.append(emb.repeat(1, 1, hc).contiguous())
+
+        saved_inputs: list[dict[int, torch.Tensor]] = [{} for _ in range(B)]
+
+        for l_idx, experts in self.streamer.iter_sweep(range(n_layers)):
+            layer_w = self.model.layers[l_idx]
+            for b in range(B):
+                H_b = H_cur[b]
+                if l_idx > min_src:
+                    saved_inputs[b][l_idx] = H_b.to("cpu") if offload_to_cpu else H_b
+                cos_b, sin_b = rope_cache[seq_lens[b]]
+                ple_b = ple_embs_list[b].get(l_idx)
+                if ple_b is not None and ple_b.device != self.device:
+                    ple_b = ple_b.to(self.device)
+                H_next, _ = decoder_layer_fwd(
+                    H_b,
+                    layer_w,
+                    experts,
+                    cos_b,
+                    sin_b,
+                    self.gdn_backend,
+                    ple_embeddings=ple_b,
+                    dequant_chunk_size=self.plan.expert_dequant_chunk,
+                    use_triton_dequant=self.plan.use_triton_fp8_dequant,
+                    keep_experts_dequantized=False,
+                )
+                H_cur[b] = H_next
+
+        cached_list: list[_CachedPromptForward] = []
+        cpu_dev = torch.device("cpu")
+        for b in range(B):
+            _, _, mixer_saved = gated_residual_fwd(H_cur[b], self.model.hyper_connection_mixer)
+            H_cur[b] = torch.empty(0)
+            mixer_saved_v = slice_gated_residual_saved(mixer_saved, bwd_starts[b])
+            del mixer_saved
+            if offload_to_cpu:
+                mixer_saved_v = _move_tensor_dict(mixer_saved_v, cpu_dev)
+            cached_list.append(
+                _CachedPromptForward(
+                    seq_len=seq_lens[b],
+                    n_valid=n_valids[b],
+                    bwd_start=bwd_starts[b],
+                    valid_pos_local=valid_pos_locals[b],
+                    layer_inputs=saved_inputs[b],
+                    mixer_saved_v=mixer_saved_v,
+                    ple_embs=ple_embs_list[b],
+                )
+            )
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_fwd_total = time.perf_counter() - t0
+        return cached_list, t_fwd_total
+
+    @torch.no_grad()
+    def _backward_from_cached_forward(
+        self,
+        cached: _CachedPromptForward,
+        src_list: list[int],
+    ) -> tuple[dict[int, torch.Tensor], float]:
+        """Run exact single-sweep backward propagation (L-1 -> min_src + 1) from a cached forward pass."""
+        t_bwd_start = time.perf_counter()
+        T = cached.seq_len
+        bwd_start = cached.bwd_start
         T_v = T - bwd_start
-        valid_pos_local = valid_pos - bwd_start
+        valid_pos_local = cached.valid_pos_local.to(self.device)
 
         D = self.cfg.hidden_size
-        hc = self.cfg.hc_count
-        D_hc = D * hc
+        D_hc = D * self.cfg.hc_count
         n_layers = self.cfg.num_hidden_layers
-        src_list = sorted(set(int(l) for l in source_layers))
-        if not src_list or src_list[0] < -1 or src_list[-1] >= n_layers:
-            raise ValueError(f"source_layers {src_list} out of valid range [-1, {n_layers - 1}]")
         src_set = set(src_list)
         min_src = src_list[0]
 
@@ -425,42 +540,16 @@ class Qwen38JLensEngine:
             device=self.device,
             dtype=self.dtype,
         )
-        ple_embs = self._get_ple_embeddings(input_ids)
+        mixer_saved_v = _move_tensor_dict(cached.mixer_saved_v, self.device)
+        ple_embs = {
+            l_idx: (t.to(self.device) if t.device != self.device else t)
+            for l_idx, t in cached.ple_embs.items()
+        }
 
-        # ---- 1. Forward Sweep (0 -> L-1, B = 1) ----
-        emb = F.embedding(input_ids, self.model.embed_tokens)
-        H = emb.repeat(1, 1, hc).contiguous()
-
-        # Save each layer's input H_{l-1} for layers >= min_src + 1 (only ~2.5 MB/layer!)
-        layer_inputs: dict[int, torch.Tensor] = {}
-        for l_idx, experts in self.streamer.iter_sweep(range(n_layers)):
-            if l_idx > min_src:
-                layer_inputs[l_idx] = H
-            H, _ = decoder_layer_fwd(
-                H,
-                self.model.layers[l_idx],
-                experts,
-                cos,
-                sin,
-                self.gdn_backend,
-                ple_embeddings=ple_embs.get(l_idx),
-                dequant_chunk_size=self.plan.expert_dequant_chunk,
-                use_triton_dequant=self.plan.use_triton_fp8_dequant,
-                keep_experts_dequantized=False,
-            )
-
-        # Final hyper_connection_mixer forward (H_{L-1} -> h_final [1, T, D])
-        _, _, mixer_saved = gated_residual_fwd(H, self.model.hyper_connection_mixer)
-        mixer_saved_v = slice_gated_residual_saved(mixer_saved, bwd_start)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        t_fwd = time.perf_counter() - t0
-
-        # ---- 2. Backward Sweep (L-1 -> min_src + 1, k_pass cotangents on [bwd_start:]!) ----
-        t_bwd_start = time.perf_counter()
         jacobians = {l: torch.zeros((D, D_hc), dtype=torch.float32) for l in src_list}
         k_pass = min(self.plan.k_pass, D)
         bwd_layers = list(range(n_layers - 1, min_src, -1))
+        non_blocking = self.device.type == "cuda"
 
         for k_start in range(0, D, k_pass):
             k_end = min(k_start + k_pass, D)
@@ -469,7 +558,9 @@ class Qwen38JLensEngine:
             # Build initial one-hot cotangent at target h_final for valid positions on [bwd_start:],
             # then immediately backprop through hyper_connection_mixer -> G_{L-1} [K_cur, T_v, D_hc]!
             G = torch.zeros((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
-            d_target_chunk = torch.zeros((min(self.plan.moe_k_chunk, K_cur), T_v, D), device=self.device, dtype=self.dtype)
+            d_target_chunk = torch.zeros(
+                (min(self.plan.moe_k_chunk, K_cur), T_v, D), device=self.device, dtype=self.dtype
+            )
             k_sub_idx = torch.arange(d_target_chunk.shape[0], device=self.device)
             for c0 in range(0, K_cur, d_target_chunk.shape[0]):
                 c1 = min(c0 + d_target_chunk.shape[0], K_cur)
@@ -492,10 +583,14 @@ class Qwen38JLensEngine:
 
             # Reverse layer sweep: L-1 -> min_src + 1
             for l_idx, experts in self.streamer.iter_sweep(bwd_layers):
+                H_in_l = cached.layer_inputs[l_idx]
+                if H_in_l.device != self.device:
+                    H_in_l = H_in_l.to(self.device, non_blocking=non_blocking)
+
                 # Recompute ONE tiny B=1 forward of layer l_idx (~0.5 ms), keeping suffix-hit active
                 # experts dequantized in BF16 when E_hit <= expert_dequant_chunk!
                 _, saved_l = decoder_layer_fwd(
-                    layer_inputs[l_idx],
+                    H_in_l,
                     self.model.layers[l_idx],
                     experts,
                     cos,
@@ -507,6 +602,7 @@ class Qwen38JLensEngine:
                     keep_experts_dequantized=True,
                     bwd_start=bwd_start,
                 )
+                del H_in_l
 
                 # In-place VJP across ALL K_cur cotangents on [bwd_start:]!
                 decoder_layer_vjp_inplace(
@@ -534,7 +630,45 @@ class Qwen38JLensEngine:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t_bwd = time.perf_counter() - t_bwd_start
-        return jacobians, T, n_valid, t_fwd, t_bwd
+        return jacobians, t_bwd
+
+    @torch.no_grad()
+    def jacobian_for_tokens(
+        self,
+        input_ids: torch.Tensor,  # [1, T]
+        source_layers: Sequence[int],
+        *,
+        skip_first: int = SKIP_FIRST_N_POSITIONS,
+        bwd_align: int = 16,
+    ) -> tuple[dict[int, torch.Tensor], int, int, float, float]:
+        """Compute exact per-prompt `J_l = E[d h_final / d H_l]` (`[D, hc_count * D]` fp32 CPU) for all `source_layers`.
+
+        Layer `-1` (optional) represents the embedding output `H_{-1} = emb.repeat(1, 1, hc_count)` before Layer 0,
+        whose 4-branch sum `J_collapsed[-1] = sum_b J_{-1}[:, b, :]` equals the exact token-embedding Jacobian
+        `E[d h_final / d emb]`.
+
+        Uses single-sweep layer-by-layer reverse propagation with 16-aligned exact causal suffix pruning:
+          - Forward sweep (0 -> L-1): runs on full `[0:T]`, saving ONLY `[1, T, 10240]` layer inputs (~120 MB total!).
+          - Backward sweep (L-1 -> min_source + 1): drops masked prefix tokens `[0 : bwd_start]` while keeping
+            `T_v = T - bwd_start` aligned to `bwd_align` (e.g. `112` at `T=128, skip_first=16`), holds ALL `k_pass`
+            cotangents in ONE in-place GPU buffer `G [k_pass, T_v, 10240]` (5.47 GiB vs 6.25 GiB), dequantizes
+            only suffix-hit experts ONCE, and overlaps next-layer DMA/NVMe prefetch 100% behind backward compute!
+        """
+        n_layers = self.cfg.num_hidden_layers
+        src_list = sorted(set(int(l) for l in source_layers))
+        if not src_list or src_list[0] < -1 or src_list[-1] >= n_layers:
+            raise ValueError(f"source_layers {src_list} out of valid range [-1, {n_layers - 1}]")
+
+        cached_list, t_fwd = self._forward_microbatch(
+            [input_ids],
+            min_src=src_list[0],
+            skip_first=skip_first,
+            bwd_align=bwd_align,
+            cache_on_cpu=False,
+        )
+        cached = cached_list[0]
+        jacobians, t_bwd = self._backward_from_cached_forward(cached, src_list)
+        return jacobians, cached.seq_len, cached.n_valid, t_fwd, t_bwd
 
     def fit(
         self,
@@ -544,6 +678,7 @@ class Qwen38JLensEngine:
         include_embedding_layer: bool = False,
         skip_first: int = SKIP_FIRST_N_POSITIONS,
         bwd_align: int = 16,
+        fwd_batch_size: int = 8,
         checkpoint_path: str | None = None,
         checkpoint_every: int = 10,
         checkpoint_manager: Any | None = None,
@@ -561,6 +696,10 @@ class Qwen38JLensEngine:
             (`embed_tokens -> H_{-1}` before Layer 0, where `J_collapsed[-1] = d h_final / d emb`).
           - `bwd_align=16` (default): exact 16-aligned causal suffix-only backward pruning of masked
             prefix tokens `[0 : bwd_start]` (`bwd_align=0` disables pruning).
+          - `fwd_batch_size=8` (default): zero-VRAM forward-only micro-batching! Amortizes the
+            weight-transfer-bound forward sweep across `fwd_batch_size` prompts (caching ~120 MB/prompt
+            in CPU RAM -> 0 GiB extra VRAM, 8x fewer forward weight sweeps!) while running exact
+            per-prompt `B=1` backward sweeps, checkpointing, and early stopping.
           - `checkpoint_manager=AsyncCheckpointManager(...)` (recommended: Local NVMe + async Google Drive
             during fitting, plus one-shot `publish_bundle_to_hf(...)` once complete!), OR
           - `checkpoint_path=".../ckpt.safetensors"` (or legacy `.pt`) for simple local checkpointing.
@@ -578,6 +717,8 @@ class Qwen38JLensEngine:
             src_layers = sorted(set(int(l) for l in source_layers))
             if include_embedding_layer and -1 not in src_layers:
                 src_layers = [-1] + src_layers
+        if not src_layers or src_layers[0] < -1 or src_layers[-1] >= n_layers:
+            raise ValueError(f"source_layers {src_layers} out of valid range [-1, {n_layers - 1}]")
 
         owned_mgr = False
         mgr: AsyncCheckpointManager | None = checkpoint_manager
@@ -644,93 +785,130 @@ class Qwen38JLensEngine:
             )
             os.replace(tmp, checkpoint_path)
 
+        fwd_bs = max(1, int(fwd_batch_size))
+        total_prompts = len(tokenized_prompts)
         sqrt_d = math.sqrt(D)
         prompts_since_ckpt = 0
+        early_stopped = False
         try:
-            for p_idx, ids in enumerate(tokenized_prompts):
-                if p_idx < next_idx:
-                    continue
-                t0 = time.perf_counter()
-                try:
-                    per_J, seq_len, n_valid, t_fwd, t_bwd = self.jacobian_for_tokens(
-                        ids, src_layers, skip_first=skip_first, bwd_align=bwd_align
-                    )
-                except ValueError as exc:
-                    logger.warning("Skipping prompt %d: %s", p_idx, exc)
-                    next_idx = p_idx + 1
-                    continue
+            batch_start = next_idx
+            while batch_start < total_prompts and not early_stopped:
+                batch_end = min(batch_start + fwd_bs, total_prompts)
 
-                max_norm = max(per_J[l].norm().item() for l in src_layers) / sqrt_d
-                if n_done > 0:
-                    rel_change = max(
-                        (
-                            (per_J[l] - jacobian_sum[l] / n_done).norm()
-                            / ((n_done + 1) * max(1e-8, (jacobian_sum[l] / n_done).norm().item()))
-                        ).item()
-                        for l in src_layers
-                    )
-                else:
-                    rel_change = float("nan")
+                # Separate valid prompts (amortized in 1 forward sweep) from too-short prompts
+                valid_entries: list[tuple[int, torch.Tensor]] = []
+                skipped_errors: dict[int, ValueError] = {}
+                for p_idx in range(batch_start, batch_end):
+                    ids = tokenized_prompts[p_idx]
+                    try:
+                        valid_position_mask(int(ids.shape[1]), skip_first=skip_first)
+                        valid_entries.append((p_idx, ids))
+                    except ValueError as exc:
+                        skipped_errors[p_idx] = exc
 
-                for l in src_layers:
-                    jacobian_sum[l].add_(per_J[l])
-                n_done += 1
-                next_idx = p_idx + 1
-                prompts_since_ckpt += 1
-                elapsed = time.perf_counter() - t0
-
-                stats = FitStats(
-                    prompt_idx=p_idx,
-                    seq_len=seq_len,
-                    n_valid=n_valid,
-                    elapsed_s=elapsed,
-                    fwd_s=t_fwd,
-                    bwd_s=t_bwd,
-                    max_norm=max_norm,
-                    mean_rel_change=rel_change,
-                )
-                if conv_logger is not None:
-                    conv_logger.append(n_done, stats)
-                if math.isfinite(rel_change):
-                    recent_deltas.append(rel_change)
-
-                logger.info(
-                    "Prompt %d/%d  T=%d (valid=%d)  %.2fs (fwd=%.2fs bwd=%.2fs)  max||J||/sqrt(d)=%.3f  d_mean=%.2e",
-                    p_idx + 1, len(tokenized_prompts), seq_len, n_valid,
-                    elapsed, t_fwd, t_bwd, max_norm, rel_change,
-                )
-                if on_prompt_done is not None:
-                    on_prompt_done(stats)
-
-                if mgr is not None and mgr.should_checkpoint(prompts_since_ckpt):
-                    mgr.save_async(
-                        jacobian_sum,
-                        n_done=n_done,
-                        next_idx=next_idx,
+                cached_by_pidx: dict[int, _CachedPromptForward] = {}
+                t_fwd_amort = 0.0
+                if valid_entries:
+                    cache_on_cpu = len(valid_entries) > 1 and self.device.type == "cuda"
+                    cached_list, t_fwd_batch = self._forward_microbatch(
+                        [ids for _, ids in valid_entries],
+                        min_src=src_layers[0],
                         skip_first=skip_first,
-                        d_model=D,
-                        hc_count=self.cfg.hc_count,
-                        wait_remote=False,
+                        bwd_align=bwd_align,
+                        cache_on_cpu=cache_on_cpu,
                     )
-                    prompts_since_ckpt = 0
-                elif mgr is None and checkpoint_path is not None and checkpoint_every > 0 and prompts_since_ckpt >= checkpoint_every:
-                    _save_legacy_pt()
-                    prompts_since_ckpt = 0
+                    t_fwd_amort = t_fwd_batch / len(valid_entries)
+                    for (p_idx, _), c_item in zip(valid_entries, cached_list, strict=True):
+                        cached_by_pidx[p_idx] = c_item
+                    del cached_list
 
-                if (
-                    stop_at_delta is not None
-                    and stop_at_delta > 0.0
-                    and n_done >= min_prompts
-                    and len(recent_deltas) >= stop_window
-                    and all(d < stop_at_delta for d in recent_deltas[-stop_window:])
-                ):
-                    logger.info(
-                        "Converged early at n_done=%d (last %d mean_rel_change < %.4g); stopping cleanly.",
-                        n_done,
-                        stop_window,
-                        stop_at_delta,
+                for p_idx in range(batch_start, batch_end):
+                    if p_idx in skipped_errors:
+                        logger.warning("Skipping prompt %d: %s", p_idx, skipped_errors[p_idx])
+                        next_idx = p_idx + 1
+                        continue
+
+                    cached = cached_by_pidx.pop(p_idx)
+                    seq_len = cached.seq_len
+                    n_valid = cached.n_valid
+                    per_J, t_bwd = self._backward_from_cached_forward(cached, src_layers)
+                    del cached
+
+                    max_norm = max(per_J[l].norm().item() for l in src_layers) / sqrt_d
+                    if n_done > 0:
+                        rel_change = max(
+                            (
+                                (per_J[l] - jacobian_sum[l] / n_done).norm()
+                                / ((n_done + 1) * max(1e-8, (jacobian_sum[l] / n_done).norm().item()))
+                            ).item()
+                            for l in src_layers
+                        )
+                    else:
+                        rel_change = float("nan")
+
+                    for l in src_layers:
+                        jacobian_sum[l].add_(per_J[l])
+                    n_done += 1
+                    next_idx = p_idx + 1
+                    prompts_since_ckpt += 1
+                    elapsed = t_fwd_amort + t_bwd
+
+                    stats = FitStats(
+                        prompt_idx=p_idx,
+                        seq_len=seq_len,
+                        n_valid=n_valid,
+                        elapsed_s=elapsed,
+                        fwd_s=t_fwd_amort,
+                        bwd_s=t_bwd,
+                        max_norm=max_norm,
+                        mean_rel_change=rel_change,
                     )
-                    break
+                    if conv_logger is not None:
+                        conv_logger.append(n_done, stats)
+                    if math.isfinite(rel_change):
+                        recent_deltas.append(rel_change)
+
+                    logger.info(
+                        "Prompt %d/%d  T=%d (valid=%d)  %.2fs (fwd=%.2fs bwd=%.2fs)  max||J||/sqrt(d)=%.3f  d_mean=%.2e",
+                        p_idx + 1, total_prompts, seq_len, n_valid,
+                        elapsed, t_fwd_amort, t_bwd, max_norm, rel_change,
+                    )
+                    if on_prompt_done is not None:
+                        on_prompt_done(stats)
+
+                    if mgr is not None and mgr.should_checkpoint(prompts_since_ckpt):
+                        mgr.save_async(
+                            jacobian_sum,
+                            n_done=n_done,
+                            next_idx=next_idx,
+                            skip_first=skip_first,
+                            d_model=D,
+                            hc_count=self.cfg.hc_count,
+                            wait_remote=False,
+                        )
+                        prompts_since_ckpt = 0
+                    elif mgr is None and checkpoint_path is not None and checkpoint_every > 0 and prompts_since_ckpt >= checkpoint_every:
+                        _save_legacy_pt()
+                        prompts_since_ckpt = 0
+
+                    if (
+                        stop_at_delta is not None
+                        and stop_at_delta > 0.0
+                        and n_done >= min_prompts
+                        and len(recent_deltas) >= stop_window
+                        and all(d < stop_at_delta for d in recent_deltas[-stop_window:])
+                    ):
+                        logger.info(
+                            "Converged early at n_done=%d (last %d mean_rel_change < %.4g); stopping cleanly.",
+                            n_done,
+                            stop_window,
+                            stop_at_delta,
+                        )
+                        early_stopped = True
+                        break
+
+                cached_by_pidx.clear()
+                batch_start = batch_end
 
         except KeyboardInterrupt:
             logger.warning("KeyboardInterrupt caught at next_idx=%d (n_done=%d); flushing checkpoint safely before exit!", next_idx, n_done)

@@ -680,4 +680,53 @@ def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     emb_pos = F.embedding(input_ids[:, -2:-1], embed_tokens)[0]  # [1, D]
     expected_emb_logits = F.linear(F.linear(emb_pos.float(), lens.collapsed_jacobians()[-1]), lm_head.float())
     assert torch.allclose(jl_logits[-1], expected_emb_logits, atol=1e-4)
+
+    # Verify zero-VRAM forward-only micro-batching (`fwd_batch_size > 1`) across variable-length
+    # prompts + a too-short skipped prompt produces bit-exact Jacobians AND amortizes forward sweeps!
+    var_prompts = [
+        torch.randint(0, V - 2, (1, 48)),
+        torch.randint(0, V - 2, (1, 10)),  # too short for skip_first=16 -> skipped cleanly
+        torch.randint(0, V - 2, (1, 32)),
+        torch.randint(0, V - 2, (1, 48)),
+        torch.randint(0, V - 2, (1, 36)),
+        torch.randint(0, V - 2, (1, 40)),
+    ]
+    orig_iter_sweep = engine.streamer.iter_sweep
+    sweep_counts = {"fwd": 0, "bwd": 0}
+
+    def _counting_sweep(layer_order):
+        order = list(layer_order)
+        if len(order) >= 2 and order[0] < order[1]:
+            sweep_counts["fwd"] += 1
+        elif order:
+            sweep_counts["bwd"] += 1
+        return orig_iter_sweep(order)
+
+    engine.streamer.iter_sweep = _counting_sweep  # type: ignore[method-assign]
+    try:
+        # 1. Batched forward (fwd_batch_size=3): chunks [0..2] (2 valid) and [3..5] (3 valid) -> ONLY 2 fwd sweeps!
+        lens_batched = engine.fit(
+            var_prompts, include_embedding_layer=True, skip_first=skip_first, fwd_batch_size=3, resume=False
+        )
+        batched_fwd_sweeps = sweep_counts["fwd"]
+        batched_bwd_sweeps = sweep_counts["bwd"]
+
+        # 2. Single-prompt forward (fwd_batch_size=1): 5 valid prompts -> 5 fwd sweeps!
+        sweep_counts["fwd"] = 0
+        sweep_counts["bwd"] = 0
+        lens_single = engine.fit(
+            var_prompts, include_embedding_layer=True, skip_first=skip_first, fwd_batch_size=1, resume=False
+        )
+        single_fwd_sweeps = sweep_counts["fwd"]
+        single_bwd_sweeps = sweep_counts["bwd"]
+    finally:
+        engine.streamer.iter_sweep = orig_iter_sweep  # type: ignore[method-assign]
+
+    assert lens_batched.n_prompts == 5 and lens_single.n_prompts == 5
+    assert batched_fwd_sweeps == 2 and single_fwd_sweeps == 5
+    assert batched_bwd_sweeps == single_bwd_sweeps
+    for l in src_layers:
+        assert torch.equal(lens_batched.jacobians[l], lens_single.jacobians[l]), (
+            f"Layer {l} mismatch between fwd_batch_size=3 and fwd_batch_size=1"
+        )
     engine.close()
