@@ -392,6 +392,19 @@ def test_sparse_moe_fp8_vjp_parity(dequant_chunk_size: int):
     assert torch.allclose(dx_fast, dx_ref, atol=1e-4)
 
 
+def test_fp8_e4m3_lut_exact_all_256_bytes():
+    """Verify the SM80 uint8->fp32 LUT matches PyTorch float8_e4m3fn bit-for-bit across all 256 byte values."""
+    from qwen38_jlens.kernels import _get_fp8_e4m3_lut
+
+    lut = _get_fp8_e4m3_lut(torch.device("cpu"))
+    assert lut.shape == (256,) and lut.dtype == torch.float32
+    ref = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+    assert torch.equal(torch.isnan(lut), torch.isnan(ref))
+    finite = ~torch.isnan(ref)
+    assert torch.equal(lut[finite], ref[finite])
+    assert lut[0x7E].item() == 448.0 and lut[0xFE].item() == -448.0
+
+
 def test_compute_aligned_bwd_start():
     assert compute_aligned_bwd_start(128, 16, align=16) == 16  # T_v = 112 (16-aligned!)
     assert compute_aligned_bwd_start(128, 32, align=16) == 32  # T_v = 96

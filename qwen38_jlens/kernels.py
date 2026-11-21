@@ -44,6 +44,24 @@ except Exception:
 # --------------------------------------------------------------------------- #
 # 1. Custom Fused Triton Kernel: 128x128 Block-Wise FP8 -> BF16 Dequantization
 # --------------------------------------------------------------------------- #
+_FP8_E4M3_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_fp8_e4m3_lut(device: torch.device) -> torch.Tensor:
+    """Cached 256-entry fp32 LUT (1 KB, L1-resident) for exact FP8 E4M3FN decode on SM80."""
+    lut = _FP8_E4M3_LUT_CACHE.get(device)
+    if lut is None:
+        lut = (
+            torch.arange(256, dtype=torch.uint8)
+            .view(torch.float8_e4m3fn)
+            .to(torch.float32)
+            .to(device)
+            .contiguous()
+        )
+        _FP8_E4M3_LUT_CACHE[device] = lut
+    return lut
+
+
 if _HAS_TRITON:
 
     @triton.jit
@@ -51,9 +69,6 @@ if _HAS_TRITON:
         w_ptr,
         s_ptr,
         out_ptr,
-        E,
-        M,
-        N,
         stride_we,
         stride_wm,
         stride_wn,
@@ -65,24 +80,68 @@ if _HAS_TRITON:
         stride_on,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        SCALE_M_RATIO: tl.constexpr,
     ):
+        """SM89+ native hardware FP8 E4M3FN -> BF16 block-128 dequant kernel."""
         pid_e = tl.program_id(0)
         pid_m = tl.program_id(1)
         pid_n = tl.program_id(2)
 
-        # Single scalar scale for this (expert, m_block, n_block) tile
-        scale = tl.load(s_ptr + pid_e * stride_se + pid_m * stride_sm + pid_n * stride_sn).to(tl.float32)
+        s_m = pid_m // SCALE_M_RATIO
+        scale = tl.load(s_ptr + pid_e * stride_se + s_m * stride_sm + pid_n * stride_sn).to(tl.float32)
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
         w_ptrs = w_ptr + pid_e * stride_we + offs_m[:, None] * stride_wm + offs_n[None, :] * stride_wn
         o_ptrs = out_ptr + pid_e * stride_oe + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
 
-        w_fp8 = tl.load(w_ptrs, mask=mask, other=0.0)
+        w_fp8 = tl.load(w_ptrs)
         w_bf16 = (w_fp8.to(tl.float32) * scale).to(tl.bfloat16)
-        tl.store(o_ptrs, w_bf16, mask=mask)
+        tl.store(o_ptrs, w_bf16)
+
+    @triton.jit
+    def _dequant_fp8_u8_lut_block_kernel(
+        w_u8_ptr,
+        lut_ptr,
+        s_ptr,
+        out_ptr,
+        stride_we,
+        stride_wm,
+        stride_wn,
+        stride_se,
+        stride_sm,
+        stride_sn,
+        stride_oe,
+        stride_om,
+        stride_on,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        SCALE_M_RATIO: tl.constexpr,
+    ):
+        """SM80 (Ampere A100) exact FP8 E4M3FN -> BF16 block-128 dequant via raw uint8 + 1 KB L1 LUT.
+
+        Triton rejects `fp8e4nv` pointer signatures on SM80 (no hardware FP8 PTX), so passing
+        `w.view(torch.uint8)` + a 256-entry fp32 LUT achieves exact bit-for-bit decoding in a
+        single HBM pass with zero temp allocations!
+        """
+        pid_e = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_n = tl.program_id(2)
+
+        s_m = pid_m // SCALE_M_RATIO
+        scale = tl.load(s_ptr + pid_e * stride_se + s_m * stride_sm + pid_n * stride_sn).to(tl.float32)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        w_ptrs = w_u8_ptr + pid_e * stride_we + offs_m[:, None] * stride_wm + offs_n[None, :] * stride_wn
+        o_ptrs = out_ptr + pid_e * stride_oe + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+
+        w_u8 = tl.load(w_ptrs).to(tl.int32)
+        w_f32 = tl.load(lut_ptr + w_u8)
+        w_bf16 = (w_f32 * scale).to(tl.bfloat16)
+        tl.store(o_ptrs, w_bf16)
 
     @triton.jit
     def _swiglu_vjp_pack_kernel(
@@ -132,7 +191,8 @@ def dequantize_fp8_blockwise(
 ) -> torch.Tensor:
     """Dequantize `[E, M, N]` FP8 E4M3 weights with `[E, M//bm, N//bn]` block scales.
 
-    Uses a single-pass Triton 2D-block kernel on CUDA when available (~1.6+ TB/s, zero temp buffers).
+    Uses a single-pass Triton 2D-block kernel on CUDA (native FP8 PTX on SM89+ Hopper/Blackwell;
+    raw uint8 + 1 KB L1 LUT on SM80 Ampere A100 where Triton does not support `fp8e4nv`).
     """
     if weight.element_size() > 1:
         return weight.to(out_dtype)
@@ -148,6 +208,7 @@ def dequantize_fp8_blockwise(
         use_triton
         and _HAS_TRITON
         and weight.is_cuda
+        and weight.dtype == torch.float8_e4m3fn
         and out_dtype == torch.bfloat16
         and bm == 128
         and bn == 128
@@ -157,27 +218,51 @@ def dequantize_fp8_blockwise(
         w_c = weight.contiguous()
         s_c = scale_inv.contiguous()
         out = torch.empty((E, M, N), device=weight.device, dtype=torch.bfloat16)
-        grid = (E, M // 128, N // 128)
-        _dequant_fp8_block_kernel[grid](
-            w_c,
-            s_c,
-            out,
-            E,
-            M,
-            N,
-            w_c.stride(0),
-            w_c.stride(1),
-            w_c.stride(2),
-            s_c.stride(0),
-            s_c.stride(1),
-            s_c.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            BLOCK_M=128,
-            BLOCK_N=128,
-            num_warps=8,
-        )
+        block_m, block_n = 32, 128
+        scale_m_ratio = bm // block_m  # 4
+        grid = (E, M // block_m, N // block_n)
+        cc = torch.cuda.get_device_capability(weight.device)
+        if cc >= (8, 9):
+            _dequant_fp8_block_kernel[grid](
+                w_c,
+                s_c,
+                out,
+                w_c.stride(0),
+                w_c.stride(1),
+                w_c.stride(2),
+                s_c.stride(0),
+                s_c.stride(1),
+                s_c.stride(2),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                SCALE_M_RATIO=scale_m_ratio,
+                num_warps=4,
+            )
+        else:
+            w_u8 = w_c.view(torch.uint8)
+            lut = _get_fp8_e4m3_lut(weight.device)
+            _dequant_fp8_u8_lut_block_kernel[grid](
+                w_u8,
+                lut,
+                s_c,
+                out,
+                w_u8.stride(0),
+                w_u8.stride(1),
+                w_u8.stride(2),
+                s_c.stride(0),
+                s_c.stride(1),
+                s_c.stride(2),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                SCALE_M_RATIO=scale_m_ratio,
+                num_warps=4,
+            )
         return out
 
     # Universal PyTorch exact fallback (handles arbitrary shapes & CPU testing)

@@ -74,9 +74,9 @@ def build_notebook() -> nbformat.NotebookNode:
         new_code_cell(
             """import os, subprocess, sys, torch
 
-# Critical CUDA allocator & fast HF transfer settings (set before heavy allocations)
+# Critical CUDA allocator & fast HF Xet transfer settings (set before heavy allocations)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -104,7 +104,6 @@ pip_install([
     "transformers>=5.17.0",
     "safetensors>=0.4.5",
     "huggingface_hub>=0.26.0",
-    "hf_transfer",
     "datasets>=3.0.0",
     "psutil",
     "tqdm",
@@ -312,8 +311,12 @@ print(f"  [OK] Active GDN kernel : {gdn_bench.name} (direct={gdn_bench._use_dire
 dev = torch.device("cuda:0")
 E_act = min(380, plan.expert_dequant_chunk)
 w_fp8 = torch.randn(E_act, 1280, 2560, device=dev).to(torch.float8_e4m3fn)
-s_fp32 = torch.ones(E_act, 10, 20, device=dev, dtype=torch.float32) * 0.05
-_ = dequantize_fp8_blockwise(w_fp8, s_fp32, use_triton=plan.use_triton_fp8_dequant)
+s_fp32 = torch.rand(E_act, 10, 20, device=dev, dtype=torch.float32) * 0.1 + 0.01
+w_bf16 = dequantize_fp8_blockwise(w_fp8, s_fp32, use_triton=plan.use_triton_fp8_dequant)
+w_ref = dequantize_fp8_blockwise(w_fp8[:2], s_fp32[:2], use_triton=False)
+deq_err = (w_bf16[:2].float() - w_ref.float()).abs().max().item()
+assert deq_err == 0.0, f"FP8 Triton dequant mismatch: max_diff={deq_err}"
+del w_ref
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 for _ in range(5):
@@ -321,7 +324,19 @@ for _ in range(5):
 torch.cuda.synchronize()
 dt_deq = (time.perf_counter() - t0) / 5
 bytes_rw = E_act * 1280 * 2560 * (1 + 2)
-print(f"  [OK] Triton FP8->BF16 dequant ({E_act} experts): {dt_deq*1e3:.2f} ms ({bytes_rw / dt_deq / 1e9:.0f} GB/s)")
+deq_mode = "native-fp8" if profile.compute_capability >= (8, 9) else "sm80-u8-lut"
+print(f"  [OK] Triton FP8->BF16 dequant ({deq_mode}, {E_act} experts): {dt_deq*1e3:.2f} ms ({bytes_rw / dt_deq / 1e9:.0f} GB/s, max_diff={deq_err:.1e})")
+
+# Verify Triton fused SwiGLU backward + pack
+_dA = torch.randn(16, 64, 640, device=dev, dtype=torch.bfloat16)
+_dg = torch.randn(16, 640, device=dev, dtype=torch.bfloat16)
+_du = torch.randn(16, 640, device=dev, dtype=torch.bfloat16)
+_sw_tri = swiglu_vjp_pack(_dA, _dg, _du, use_triton=plan.use_triton_swiglu_vjp)
+_sw_ref = swiglu_vjp_pack(_dA, _dg, _du, use_triton=False)
+sw_err = (_sw_tri.float() - _sw_ref.float()).abs().max().item()
+assert sw_err <= 1e-2, f"Triton SwiGLU mismatch: max_diff={sw_err}"
+print(f"  [OK] Triton SwiGLU VJP pack : verified (max_diff={sw_err:.1e})")
+del _dA, _dg, _du, _sw_tri, _sw_ref
 
 K_blk = plan.moe_k_chunk
 S_rows = 128 * 10
