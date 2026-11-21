@@ -349,17 +349,158 @@ def _reduce_valid_mean_cpu(
     return out
 
 
+def _gpu_tensor_bytes(obj: Any, seen: set[int] | None = None) -> int:
+    """Recursively sum bytes of CUDA tensors inside dataclasses / dicts / lists (deduplicated by storage)."""
+    if seen is None:
+        seen = set()
+    if isinstance(obj, torch.Tensor):
+        if obj.device.type != "cuda":
+            return 0
+        key = obj.untyped_storage().data_ptr()
+        if key in seen:
+            return 0
+        seen.add(key)
+        return obj.untyped_storage().nbytes()
+    if isinstance(obj, dict):
+        return sum(_gpu_tensor_bytes(v, seen) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_gpu_tensor_bytes(v, seen) for v in obj)
+    if hasattr(obj, "__dataclass_fields__"):
+        return sum(_gpu_tensor_bytes(getattr(obj, f), seen) for f in obj.__dataclass_fields__)
+    return 0
+
+
+def model_vram_breakdown(model: LoadedQwen38Model, streamer: "AsyncMoEStreamer | None" = None) -> dict[str, float]:
+    """Live per-component GPU memory breakdown (GiB) — makes any budget discrepancy visible immediately."""
+    gib = 1024**3
+    out = {
+        "dense_gib": (
+            _gpu_tensor_bytes(model.layers)
+            + _gpu_tensor_bytes(model.embed_tokens)
+            + _gpu_tensor_bytes(model.hyper_connection_mixer)
+        ) / gib,
+        "tier0_moe_gib": _gpu_tensor_bytes(
+            [v for v in model.moe_tier_store.values() if isinstance(v, MoeExpertPayload)]
+        ) / gib,
+        "staging_gib": (_gpu_tensor_bytes(streamer._gpu_slots) / gib) if streamer is not None else 0.0,
+        "allocated_gib": 0.0,
+        "reserved_gib": 0.0,
+        "free_gib": 0.0,
+        "total_gib": 0.0,
+    }
+    if model.device.type == "cuda" and torch.cuda.is_available():
+        free_b, total_b = torch.cuda.mem_get_info(model.device)
+        out["allocated_gib"] = torch.cuda.memory_allocated(model.device) / gib
+        out["reserved_gib"] = torch.cuda.memory_reserved(model.device) / gib
+        out["free_gib"] = free_b / gib
+        out["total_gib"] = total_b / gib
+    return out
+
+
+def ensure_vram_headroom(
+    model: LoadedQwen38Model,
+    *,
+    reserve_gib: float | None = None,
+    free_gib: float | None = None,
+) -> list[int]:
+    """Self-healing OOM guard: demote Tier-0 MoE layers to pinned host RAM until live free VRAM covers
+    `plan.runtime_vram_reserve_gib` (+ any GPU staging slots the streamer still has to allocate).
+
+    Backward is compute-bound and Tier-1 H2D DMA hides behind adjacent layers, so demoting a few Tier-0
+    layers costs ~0% speed while turning a guaranteed mid-run OOM into a clean run. Returns demoted layers.
+    """
+    plan = model.plan
+    if model.device.type != "cuda":
+        return []
+    reserve = plan.runtime_vram_reserve_gib if reserve_gib is None else float(reserve_gib)
+    if reserve <= 0.0:
+        return []
+    if free_gib is None:
+        torch.cuda.empty_cache()
+        free_gib = torch.cuda.mem_get_info(model.device)[0] / (1024**3)
+
+    demoted, need = select_tier0_layers_to_demote(plan, free_gib=free_gib, reserve_gib=reserve)
+    if not demoted:
+        return []
+    weight_dtype = torch.float8_e4m3fn if model.config.is_fp8_experts else model.compute_dtype
+    for l_idx in demoted:
+        gpu_payload = model.moe_tier_store[l_idx]
+        assert isinstance(gpu_payload, MoeExpertPayload)
+        alloc_kwargs = dict(
+            device="cpu",
+            weight_dtype=weight_dtype,
+            block_size=model.config.fp8_block_size,
+        )
+        dims = (model.config.num_experts, model.config.hidden_size, model.config.moe_intermediate_size)
+        try:
+            host = allocate_moe_payload(*dims, pin_memory=True, **alloc_kwargs)
+            new_tier = StorageTier.HOST_PINNED
+        except RuntimeError:
+            # Pinning can fail on tight-RAM hosts: keep it pageable and stream via the pinned host ring.
+            host = allocate_moe_payload(*dims, pin_memory=False, **alloc_kwargs)
+            new_tier = StorageTier.HOST_PAGEABLE
+            plan.host_pinned_staging_slots = max(2, plan.host_pinned_staging_slots)
+        _copy_payload_async(host, gpu_payload, non_blocking=False)
+        model.moe_tier_store[l_idx] = host
+        plan.layer_tiers[l_idx] = new_tier
+        del gpu_payload
+    if plan.gpu_staging_slots == 0:
+        plan.gpu_staging_slots = 2
+    torch.cuda.synchronize(model.device)
+    torch.cuda.empty_cache()
+    logger.warning(
+        "VRAM self-heal: free %.1f GiB < required %.1f GiB -> demoted %d Tier-0 MoE layers to pinned RAM: %s",
+        free_gib, need, len(demoted), demoted,
+    )
+    return demoted
+
+
+def select_tier0_layers_to_demote(
+    plan: Any,
+    *,
+    free_gib: float,
+    reserve_gib: float,
+) -> tuple[list[int], float]:
+    """Pure planner: which Tier-0 layers to demote so `free_gib >= reserve + staging slots`.
+
+    Returns `(layers, required_gib)`. Picks maximally spread-out Tier-0 layers so the remaining GPU layers
+    stay interleaved with the Tier-1 layers (every H2D DMA keeps a Tier-0 layer to hide behind).
+    """
+    layer_gib = plan.bytes_per_moe_layer / (1024**3)
+    tier0 = sorted(l for l, t in plan.layer_tiers.items() if t == StorageTier.GPU_HBM)
+    need = reserve_gib + plan.gpu_staging_slots * layer_gib
+    if free_gib >= need or not tier0:
+        return [], need
+    # Demoting means streaming from host -> the 2 double-buffered GPU staging slots must exist too.
+    need = reserve_gib + max(2, plan.gpu_staging_slots) * layer_gib
+    n_demote = min(len(tier0), math.ceil((need - free_gib) / layer_gib))
+    return [tier0[p] for p in _evenly_spaced_positions(len(tier0), n_demote)], need
+
+
+def _evenly_spaced_positions(n: int, count: int) -> list[int]:
+    if count <= 0:
+        return []
+    if count >= n:
+        return list(range(n))
+    return sorted({min(n - 1, int((k + 0.5) * n / count)) for k in range(count)})
+
+
 class Qwen38JLensEngine:
     """High-performance single-sweep Jacobian Lens fitter and inference applier for Qwen3.8-Flash-Next."""
 
-    def __init__(self, model: LoadedQwen38Model) -> None:
+    def __init__(self, model: LoadedQwen38Model, *, auto_vram_headroom: bool = True) -> None:
         self.model = model
         self.cfg = model.config
         self.plan = model.plan
         self.device = model.device
         self.dtype = model.compute_dtype
         self.gdn_backend = GatedDeltaRuleBackend(preferred=self.plan.gdn_backend)
+        # Verify REAL post-load headroom before allocating staging slots (self-healing OOM guard).
+        self.demoted_layers = ensure_vram_headroom(model) if auto_vram_headroom else []
         self.streamer = AsyncMoEStreamer(model)
+
+    def vram_breakdown(self) -> dict[str, float]:
+        return model_vram_breakdown(self.model, self.streamer)
 
     def close(self) -> None:
         self.streamer.close()
@@ -789,6 +930,7 @@ class Qwen38JLensEngine:
             n_done = 0
             next_idx = 0
         resumed_next_idx = next_idx
+        resumed_n_done = n_done
 
         csv_path = convergence_csv_path or (mgr.cfg.local_convergence_csv if mgr is not None else None)
         conv_logger = ConvergenceLogger(csv_path, resume_next_idx=next_idx) if csv_path else None
@@ -863,6 +1005,13 @@ class Qwen38JLensEngine:
                     n_valid = cached.n_valid
                     per_J, t_bwd = self._backward_from_cached_forward(cached, src_layers)
                     del cached
+                    if self.device.type == "cuda" and n_done == resumed_n_done:
+                        peak = torch.cuda.max_memory_allocated(self.device) / (1024**3)
+                        total = torch.cuda.get_device_properties(self.device).total_memory / (1024**3)
+                        logger.info(
+                            "First-prompt peak VRAM: %.1f / %.1f GiB allocated (%.1f GiB headroom).",
+                            peak, total, total - peak,
+                        )
 
                     max_norm = max(per_J[l].norm().item() for l in src_layers) / sqrt_d
                     if n_done > 0:

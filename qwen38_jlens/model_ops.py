@@ -551,7 +551,9 @@ def qsa_layer_vjp(
     d_gated = torch.matmul(d_out, w.o_proj)  # [K_sub, T_v, H_q * Dh]
     d_gate = d_gated * attn_out_s.unsqueeze(0) * d_sig_gate_s.unsqueeze(0)
     d_attn_flat = d_gated * sig_gate_s.unsqueeze(0)
+    del d_gated
     dO = d_attn_flat.view(K_sub, T_v, H_q, Dh).transpose(1, 2).contiguous()  # [K_sub, H_q, T_v, Dh]
+    del d_attn_flat
 
     # 2. Core causal attention VJP (exact suffix-to-suffix block A_VV + exact dQ[s:] over full keys [0:T_full])
     if saved["attn_mode"] == "l2_cached":
@@ -563,19 +565,26 @@ def qsa_layer_vjp(
         V_all = saved["v_rep"]                                             # [H_q, T_full, Dh]
 
         dO_h = dO.transpose(0, 1).contiguous()                             # [H_q, K_sub, T_v, Dh]
+        del dO
 
         # dV[s:] = P[s:, s:]^T @ dO[s:] (causal: P[q, k] = 0 for q < k => prefix q < s never contributes to k >= s)
         dO_for_v = dO_h.permute(0, 2, 1, 3).reshape(H_q, T_v, K_sub * Dh)
         dV_rep = torch.bmm(P_vv_t.transpose(1, 2), dO_for_v).view(H_q, T_v, K_sub, Dh).permute(2, 0, 1, 3)
+        del dO_for_v
 
         # dP[s:, 0:T_full] = dO[s:] @ V[0:T_full]^T
         dP = torch.bmm(dO_h.view(H_q, K_sub * T_v, Dh), V_all.transpose(1, 2)).view(H_q, K_sub, T_v, T_full)
+        del dO_h
 
-        # Softmax VJP in fp32 over full causal support [0:T_full]: dS = P * (dP - sum(dP * P)) * scaling
+        # Softmax VJP in-place in fp32 over full causal support [0:T_full]: dS = P * (dP - sum(dP * P)) * scaling
         dP_f = dP.float()
+        del dP
         P_va_b = P_va.unsqueeze(1)
         D_dot = (dP_f * P_va_b).sum(dim=-1, keepdim=True)
-        dS = ((P_va_b * (dP_f - D_dot)) * saved["scaling"]).to(dtype)      # [H_q, K_sub, T_v, T_full]
+        dP_f.sub_(D_dot).mul_(P_va_b).mul_(saved["scaling"])
+        del D_dot
+        dS = dP_f.to(dtype)                                                # [H_q, K_sub, T_v, T_full]
+        del dP_f
 
         # dQ[s:] = dS[s:, 0:T_full] @ K[0:T_full]
         dQ_rot = torch.bmm(dS.view(H_q, K_sub * T_v, T_full), K_all).view(H_q, K_sub, T_v, Dh).transpose(0, 1)
@@ -585,6 +594,7 @@ def qsa_layer_vjp(
         dK_rep = torch.bmm(
             dS_vv.transpose(-1, -2).reshape(H_q, K_sub * T_v, T_v), Q_v
         ).view(H_q, K_sub, T_v, Dh).transpose(0, 1)                         # [K_sub, H_q, T_v, Dh]
+        del dS, dS_vv
     else:
         with torch.enable_grad():
             q_e = saved["q_rot"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
@@ -592,6 +602,7 @@ def qsa_layer_vjp(
             v_e = saved["v_rep"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
             o_e = F.scaled_dot_product_attention(q_e, k_e, v_e, is_causal=True, scale=saved["scaling"])
             dO_full = F.pad(dO, (0, 0, s, 0)) if s > 0 else dO
+            del dO
             dQ_rot, dK_rep, dV_rep = torch.autograd.grad(o_e, (q_e, k_e, v_e), grad_outputs=dO_full)
             if s > 0:
                 dQ_rot = dQ_rot[:, :, s:, :]
@@ -601,12 +612,14 @@ def qsa_layer_vjp(
     # Reduce GQA heads H_q -> H_kv
     dK_rot = dK_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)           # [K_sub, H_kv, T_v, Dh]
     dV = dV_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)               # [K_sub, H_kv, T_v, Dh]
+    del dK_rep, dV_rep
 
     # 3. Inverse partial RoPE on [s:]
     cos = saved["cos"][:, :, s:, :] if s > 0 else saved["cos"]
     sin = saved["sin"][:, :, s:, :] if s > 0 else saved["sin"]
     dQ_normed = apply_partial_rope(dQ_rot, cos, -sin).transpose(1, 2)      # [K_sub, T_v, H_q, Dh]
     dK_normed = apply_partial_rope(dK_rot, cos, -sin).transpose(1, 2)      # [K_sub, T_v, H_kv, Dh]
+    del dQ_rot, dK_rot
 
     # 4. q_norm & k_norm VJP on [s:]
     q_xhat = saved["q_xhat"][:, s:] if s > 0 else saved["q_xhat"]
@@ -615,17 +628,20 @@ def qsa_layer_vjp(
     k_rstd = saved["k_rstd"][:, s:] if s > 0 else saved["k_rstd"]
     dQ_raw = rmsnorm_vjp(dQ_normed, q_xhat, q_rstd, w.q_norm)
     dK_raw = rmsnorm_vjp(dK_normed, k_xhat, k_rstd, w.k_norm)
+    del dQ_normed, dK_normed
 
     # 5. Pack [dQ_raw, d_gate] matching q_proj output layout [K_sub, T_v, H_q, 2*Dh]
     dQG = torch.cat([dQ_raw, d_gate.view(K_sub, T_v, H_q, Dh)], dim=-1).reshape(K_sub, T_v, H_q * Dh * 2)
     dK_flat = dK_raw.reshape(K_sub, T_v, H_kv * Dh)
     dV_flat = dV.transpose(1, 2).reshape(K_sub, T_v, H_kv * Dh)
+    del dQ_raw, dK_raw, d_gate, dV
 
-    d_x = (
-        torch.matmul(dQG, w.q_proj)
-        + torch.matmul(dK_flat, w.k_proj)
-        + torch.matmul(dV_flat, w.v_proj)
-    )
+    d_x = torch.matmul(dQG, w.q_proj)
+    del dQG
+    d_x.add_(torch.matmul(dK_flat, w.k_proj))
+    del dK_flat
+    d_x.add_(torch.matmul(dV_flat, w.v_proj))
+    del dV_flat
     return d_x
 
 
@@ -697,10 +713,13 @@ def gdn_layer_vjp(
     else:
         norm_s = saved["norm_saved"]
     d_core_out, d_z = rmsnorm_gated_vjp(d_norm_out, norm_s)
+    del d_norm_out
 
     # 2. Core Gated Delta Rule VJP (zero-pad [0:s] to preserve exact 128-aligned FlashQLA/FLA tiles!)
     d_core_in = F.pad(d_core_out, (0, 0, 0, 0, s, 0)) if s > 0 else d_core_out
+    del d_core_out
     dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(saved["gdn_saved"], d_core_in)
+    del d_core_in
     if s > 0:
         dq = dq[:, s:]
         dk = dk[:, s:]
@@ -713,24 +732,29 @@ def gdn_layer_vjp(
     sig_adt = saved["sig_a_plus_dt"][:, s:] if s > 0 else saved["sig_a_plus_dt"]
     db = (dbeta.float() * beta_f * (1.0 - beta_f)).to(dtype)
     da = (dg.float() * saved["neg_exp_A"] * sig_adt).to(dtype)
+    del dbeta, dg
 
     # 4. Pack [dq, dk, dv] -> causal_conv1d + SiLU VJP on [s:] (causal adjoint only looks at t' >= t >= s!)
     d_mixed_t = torch.cat(
         [dq.reshape(K_sub, T_v, -1), dk.reshape(K_sub, T_v, -1), dv.reshape(K_sub, T_v, -1)],
         dim=-1,
     )
+    del dq, dk, dv
     pre_silu_s = saved["conv_pre_silu"][:, :, s:] if s > 0 else saved["conv_pre_silu"]
     d_conv_in = causal_conv1d_silu_bwd(
         d_mixed_t.transpose(1, 2), pre_silu_s, w.conv1d_weight
     ).transpose(1, 2)  # [K_sub, T_v, conv_dim]
+    del d_mixed_t
 
     # 5. Input projections VJP on [s:]
-    d_x = (
-        torch.matmul(d_conv_in, w.in_proj_qkv)
-        + torch.matmul(d_z.reshape(K_sub, T_v, val_dim), w.in_proj_z)
-        + torch.matmul(db, w.in_proj_b)
-        + torch.matmul(da, w.in_proj_a)
-    )
+    d_x = torch.matmul(d_conv_in, w.in_proj_qkv)
+    del d_conv_in
+    d_x.add_(torch.matmul(d_z.reshape(K_sub, T_v, val_dim), w.in_proj_z))
+    del d_z
+    d_x.add_(torch.matmul(db, w.in_proj_b))
+    del db
+    d_x.add_(torch.matmul(da, w.in_proj_a))
+    del da
     return d_x
 
 
@@ -832,7 +856,9 @@ def moe_block_fwd(
             experts, active_ids, dense.fp8_block_size, dtype, use_triton_dequant
         )
         # Forward: [S, D] @ [E_hit, D, 2*r_inter] -> [S, 2*r_inter]
-        gu_out = grouped_mm(x_sorted, W_gu.transpose(-2, -1).contiguous(), offs_1, offs_1_list)
+        # Pass the column-major transposed VIEW directly (grouped_mm accepts either major-ness);
+        # a `.contiguous()` here used to allocate a second 3.1 GiB (+1.56 GiB for W_dn) expert copy!
+        gu_out = grouped_mm(x_sorted, W_gu.transpose(-2, -1), offs_1, offs_1_list)
         g_act, u_act = gu_out.chunk(2, dim=-1)
         gf = g_act.float()
         sig = torch.sigmoid(gf)
@@ -840,7 +866,7 @@ def moe_block_fwd(
         a_out = (silu_g * u_act.float()).to(dtype)
         da_dg_sorted.copy_((sig * (1.0 + gf * (1.0 - sig)) * u_act.float()).to(dtype))
         da_du_sorted.copy_(silu_g.to(dtype))
-        y_exp_sorted.copy_(grouped_mm(a_out, W_dn.transpose(-2, -1).contiguous(), offs_1, offs_1_list))
+        y_exp_sorted.copy_(grouped_mm(a_out, W_dn.transpose(-2, -1), offs_1, offs_1_list))
         if keep_dequantized_for_bwd:
             cached_W_gu = W_gu
             cached_W_dn = W_dn
@@ -856,7 +882,7 @@ def moe_block_fwd(
             W_gu, W_dn = _extract_active_experts_bf16(
                 experts, active_ids[c_start:c_end], dense.fp8_block_size, dtype, use_triton_dequant
             )
-            gu_out = grouped_mm(x_sorted[row_lo:row_hi], W_gu.transpose(-2, -1).contiguous(), sub_offs, sub_offs_list)
+            gu_out = grouped_mm(x_sorted[row_lo:row_hi], W_gu.transpose(-2, -1), sub_offs, sub_offs_list)
             g_act, u_act = gu_out.chunk(2, dim=-1)
             gf = g_act.float()
             sig = torch.sigmoid(gf)
@@ -865,7 +891,7 @@ def moe_block_fwd(
             da_dg_sorted[row_lo:row_hi].copy_((sig * (1.0 + gf * (1.0 - sig)) * u_act.float()).to(dtype))
             da_du_sorted[row_lo:row_hi].copy_(silu_g.to(dtype))
             y_exp_sorted[row_lo:row_hi].copy_(
-                grouped_mm(a_out, W_dn.transpose(-2, -1).contiguous(), sub_offs, sub_offs_list)
+                grouped_mm(a_out, W_dn.transpose(-2, -1), sub_offs, sub_offs_list)
             )
             del W_gu, W_dn
 
@@ -967,28 +993,33 @@ def moe_block_vjp_all(
     p_dot_W = saved["p_dot_W_router"]     # [T, D]
     W_r_top = saved["W_router_top"]       # [T, k, D]
 
-    for k0 in range(0, K_total, moe_k_chunk):
-        k1 = min(k0 + moe_k_chunk, K_total)
-        dy_tk = dY_TK[:, k0:k1, :]  # [T, K_blk, D]
+    # Token-major view of the routed expert outputs: y_exp_tok[t, r] = y_exp_sorted[slot(t, r)].
+    # Built ONCE per layer ([T, k, D] fp32 = 11 MB at T_v=112) so the router VJP becomes ONE batched
+    # GEMM per K chunk instead of gathering a [S, K_blk, D] copy of dY (+ two fp32 casts = 6.84 GiB!).
+    y_exp_tok_f = y_exp_sorted[inv_perm].view(T, top_k, D).float()   # [T, k, D] fp32
+    sh_out_f = sh_out.float().unsqueeze(-1)                           # [T, D, 1] fp32
+
+    # Small dense ops: 64-wide K chunks keep every fp32 temp <= 0.07 GiB at T_v=112.
+    dense_k_chunk = min(64, moe_k_chunk)
+    for k0 in range(0, K_total, dense_k_chunk):
+        k1 = min(k0 + dense_k_chunk, K_total)
+        dy_tk = dY_TK[:, k0:k1, :]  # [T, K_blk, D] (view)
+        dy_f = dy_tk.float()        # [T, K_blk, D] fp32 (shared by gate-logit & router dot products)
 
         # 1a. Shared expert VJP
-        d_sh_out = dy_tk * sg_val.unsqueeze(1)  # [T, K_blk, D]
-        d_sg_logit = (dy_tk.float() * sh_out.float().unsqueeze(1)).sum(dim=-1, keepdim=True).to(dtype) * d_sg.unsqueeze(1)
-        d_sh_act = torch.matmul(d_sh_out, dense.shared_down_proj)  # [T, K_blk, sh_inter]
-        d_sh_g = d_sh_act * sh_da_dg.unsqueeze(1)
-        d_sh_u = d_sh_act * sh_da_du.unsqueeze(1)
-        dx_shared = (
-            torch.matmul(d_sh_g, dense.shared_gate_proj)
-            + torch.matmul(d_sh_u, dense.shared_up_proj)
-            + torch.matmul(d_sg_logit, dense.shared_expert_gate)
-        )
+        # d_sg_logit[t, k] = <dY[t, k, :], sh_out[t, :]> * sigmoid'(.) -> exact fp32 batched dot product
+        d_sg_logit = torch.bmm(dy_f, sh_out_f).to(dtype) * d_sg.unsqueeze(1)  # [T, K_blk, 1]
+        d_sh_act = torch.matmul(dy_tk * sg_val.unsqueeze(1), dense.shared_down_proj)  # [T, K_blk, sh_inter]
+        dx_acc = torch.matmul(d_sh_act * sh_da_dg.unsqueeze(1), dense.shared_gate_proj)
+        dx_acc.add_(torch.matmul(d_sh_act * sh_da_du.unsqueeze(1), dense.shared_up_proj))
+        del d_sh_act
+        dx_acc.add_(torch.matmul(d_sg_logit, dense.shared_expert_gate))
+        del d_sg_logit
 
-        # 1b. Exact Top-K Router VJP (without materializing [T, K_blk, 512]!)
-        # dw_sorted[s, k] = <dY[tok(s), k, :], y_exp_sorted[s, :]>
-        dy_sorted_raw = dy_tk[tok_of_sorted]  # [S, K_blk, D]
-        dw_sorted = (dy_sorted_raw.float() * y_exp_sorted.float().unsqueeze(1)).sum(dim=-1)  # [S, K_blk]
-        del dy_sorted_raw
-        dw = dw_sorted[inv_perm].view(T, top_k, k1 - k0).transpose(1, 2)  # [T, K_blk, k] fp32
+        # 1b. Exact Top-K Router VJP (without materializing [T, K_blk, 512] or [S, K_blk, D]!)
+        # dw[t, k, r] = <dY[t, k, :], y_exp[slot(t, r), :]>  ->  [T, K_blk, D] @ [T, D, k]
+        dw = torch.bmm(dy_f, y_exp_tok_f.transpose(1, 2))  # [T, K_blk, k] fp32
+        del dy_f
         if top_sum is not None:
             dot_w = (dw * rw_f.unsqueeze(1)).sum(dim=-1, keepdim=True)
             d_top_v = (dw - dot_w) / top_sum.unsqueeze(1)
@@ -997,11 +1028,12 @@ def moe_block_vjp_all(
         # Softmax VJP: sum_e p_e (dp_e - dot_p) W_e = sum_r (p_r * d_top_v_r) W_{idx_r} - dot_p * (p @ W)
         p_times_dv = d_top_v * top_vals_raw.unsqueeze(1)  # [T, K_blk, k] fp32
         dot_p = p_times_dv.sum(dim=-1, keepdim=True)      # [T, K_blk, 1] fp32
-        dx_router = (
-            torch.bmm(p_times_dv.to(dtype), W_r_top)
-            - dot_p.to(dtype) * p_dot_W.unsqueeze(1)
-        )
-        dX_TK[:, k0:k1, :].add_(dx_shared + dx_router)
+        dx_acc.add_(torch.bmm(p_times_dv.to(dtype), W_r_top))
+        dx_acc.sub_(dot_p.to(dtype) * p_dot_W.unsqueeze(1))
+        del dw, d_top_v, p_times_dv, dot_p
+        dX_TK[:, k0:k1, :].add_(dx_acc)
+        del dx_acc
+    del y_exp_tok_f, sh_out_f
 
     # 2. Routed experts VJP (each expert chunk dequantized ONLY ONCE across ALL K_total!)
     da_dg_sorted = saved["da_dg_sorted"]
@@ -1043,8 +1075,9 @@ def moe_block_vjp_all(
             k1 = min(k0 + moe_k_chunk, K_total)
             K_blk = k1 - k0
 
-            # Gather [n_rows, K_blk, D] and scale by routing weights
-            dy_s = dY_TK[sub_tok, k0:k1, :] * sub_w[:, None, None]  # [n_rows, K_blk, D]
+            # Gather [n_rows, K_blk, D] and scale by routing weights IN-PLACE (1x 1.37 GiB, not 2x!)
+            dy_s = dY_TK[sub_tok, k0:k1, :]  # advanced indexing -> fresh contiguous copy
+            dy_s.mul_(sub_w[:, None, None])  # [n_rows, K_blk, D]
             offs_K = sub_offs_1 * K_blk
             offs_K_list = [v * K_blk for v in sub_offs_1_list]
 

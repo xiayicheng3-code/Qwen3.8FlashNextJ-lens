@@ -392,6 +392,41 @@ def test_sparse_moe_fp8_vjp_parity(dequant_chunk_size: int):
     assert torch.allclose(dx_fast, dx_ref, atol=1e-4)
 
 
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+def test_sparse_moe_vjp_tk_layout_multichunk_router_parity(norm_topk_prob: bool):
+    """K=150 > 64 exercises the 64-wide bmm shared/router VJP chunks (64, 64, 22) + tk_layout I/O."""
+    torch.manual_seed(11)
+    T, D, E, top_k, inter, K = 10, 32, 16, 4, 16, 150
+    dense = MoeDenseWeights(
+        router_weight=torch.randn(E, D) * 0.2,
+        shared_gate_proj=torch.randn(inter, D) * 0.1,
+        shared_up_proj=torch.randn(inter, D) * 0.1,
+        shared_down_proj=torch.randn(D, inter) * 0.1,
+        shared_expert_gate=torch.randn(1, D) * 0.1,
+        num_experts=E,
+        top_k=top_k,
+        norm_topk_prob=norm_topk_prob,
+        fp8_block_size=(16, 16),
+    )
+    gu_q, gu_s = _quantize_fp8_block(torch.randn(E, 2 * inter, D) * 0.15, 16, 16)
+    dn_q, dn_s = _quantize_fp8_block(torch.randn(E, D, inter) * 0.15, 16, 16)
+    experts = MoeExpertPayload(gate_up_proj=gu_q, down_proj=dn_q, gate_up_scale=gu_s, down_scale=dn_s)
+
+    x = torch.randn(1, T, D)
+    dy = torch.randn(K, T, D)
+    _, saved = moe_block_fwd(x, dense, experts, dequant_chunk_size=16, use_triton_dequant=False, keep_dequantized_for_bwd=True)
+    dx_tk = moe_block_vjp_all(
+        dy.transpose(0, 1).contiguous(), dense, experts, saved,
+        moe_k_chunk=128, dequant_chunk_size=16, use_triton_dequant=False, use_triton_swiglu=False, tk_layout=True,
+    )
+    assert dx_tk.shape == (T, K, D)
+
+    x_r = x.expand(K, -1, -1).clone().requires_grad_(True)
+    y_r = _ref_moe(x_r, dense, experts)
+    (dx_ref,) = torch.autograd.grad(y_r, x_r, grad_outputs=dy)
+    assert torch.allclose(dx_tk.transpose(0, 1), dx_ref, atol=1e-4)
+
+
 def test_fp8_e4m3_lut_exact_all_256_bytes():
     """Verify the SM80 uint8->fp32 LUT matches PyTorch float8_e4m3fn bit-for-bit across all 256 byte values."""
     from qwen38_jlens.kernels import _get_fp8_e4m3_lut

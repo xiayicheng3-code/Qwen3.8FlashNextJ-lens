@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Deterministically build the self-contained Google Colab notebook `qwen38_jlens_colab.ipynb`
-directly from the pytest-verified `qwen38_jlens/` package modules."""
+"""Deterministically build the clean, readable Google Colab notebook `qwen38_jlens_colab.ipynb`
+that installs and imports `qwen38_jlens` directly from the public GitHub repository."""
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 
@@ -12,12 +11,8 @@ import nbformat
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
 
 ROOT = Path(__file__).resolve().parent
-PKG = ROOT / "qwen38_jlens"
 OUT_NB = ROOT / "qwen38_jlens_colab.ipynb"
-
-
-def _read_module(name: str) -> str:
-    return (PKG / name).read_text(encoding="utf-8").rstrip() + "\n"
+REPO_URL = "https://github.com/xiayicheng3-code/Qwen3.8FlashNextJ-lens.git"
 
 
 def build_notebook() -> nbformat.NotebookNode:
@@ -31,35 +26,36 @@ def build_notebook() -> nbformat.NotebookNode:
             """# ⚡ Fastest Qwen3.8-Flash-Next Jacobian Lens (J-Lens) Fitting Notebook
 
 **Auto-adapts to randomly assigned Google Colab High-RAM runtimes: `G4` (RTX PRO 6000 Blackwell 96 GB), `A100 80 GB`, and `A100 40 GB`.**
+Imports [`qwen38_jlens`](https://github.com/xiayicheng3-code/Qwen3.8FlashNextJ-lens) directly from GitHub so the notebook stays short, readable, and always up to date.
 
 ---
 
 ### Why Naive J-Lens Fitting Fails on Qwen3.8-Flash-Next (`qwen4_exp`)
 1. **4-Branch Gated Residual (`hc_count=4`)**: Decoder layers output `[B, T, 10240]` (`4 × 2560`), collapsed to `[B, T, 2560]` by a final `hyper_connection_mixer` before `lm_head` (there is no `model.norm`). Standard `jlens.from_hf` crashes immediately.
    - Our exact J-lens targets `h_final = hyper_connection_mixer(H_47)` (`2560` dims) w.r.t. each layer's full 4-branch residual `H_l` (`10240` dims), yielding **`J_l ∈ R^{2560 × 10240}`** in the **exact same number of output cotangents (`K = 2560`)**!
-2. **172.78 GiB FP8 Checkpoint (`112.5 GiB` MoE + `47.7 GiB` 51B PLE + `8.2 GiB` dense BF16)**:
+2. **172.78 GiB FP8 Checkpoint (`112.5 GiB` MoE + `47.7 GiB` 51B PLE + `8.0 GiB` dense BF16)**:
    - Naive `dim_batch=8` backprop streams `112.5 GiB` across PCIe **320× per prompt** (`36 TB/prompt` ≈ 24 minutes/prompt!) and OOM-kills A100-40G (83.5 GiB RAM) immediately.
    - Naive HF `AutoModelForCausalLM` triggers `transformers#48349` (silently corrupting BF16 dense layers) and downloads unneeded Vision + MTP shards.
 
 ---
 
-### Core Breakthroughs in This Notebook
+### Core Breakthroughs
 | Optimization | Impact |
 |---|---|
-| **Single-Sweep Layer-by-Layer Reverse Propagation + 16-Aligned Causal Suffix Pruning** | Forward runs ONCE per micro-batch of `FWD_BATCH_SIZE = 8` prompts (caching ~120 MB/prompt in CPU RAM -> **0 GiB extra VRAM, 8× fewer forward weight sweeps**!). Backward exploits block lower-triangular causality to prune masked prefix tokens `[0 : bwd_start]` (`T_v = 112` at `T = 128, skip_first = 16`), holding ALL `K = 2560` cotangents in ONE in-place GPU buffer (`5.47 GiB`, `+0.78 GiB` VRAM headroom) while preserving 128-wide MoE/projection/FlashQLA tiling and computing all `2560` VJPs of layer `l` **before** moving to layer `l-1` -> **1× backward weight sweep/prompt** (40×–120× less PCIe/NVMe traffic!). |
-| **Fused Active-Expert MoE VJP (`grouped_mm` + Triton)** | Each layer dequantizes ONLY hit experts **ONCE** via a custom 128×128 Triton FP8 kernel (~2.5 ms), runs Tensor-Core-saturated CUTLASS/cuBLAS `grouped_mm` across `n_e × K_blk` rows, fuses SwiGLU backward in Triton, and includes the exact top-k softmax router VJP without materializing `[T, K, 512]`. |
+| **Single-Sweep Reverse Propagation + 16-Aligned Causal Suffix Pruning** | Forward runs ONCE per micro-batch of `FWD_BATCH_SIZE = 8` prompts (caching ~120 MB/prompt in CPU RAM -> **0 GiB extra GPU VRAM, 8× fewer forward weight sweeps**!). Backward exploits block lower-triangular causality to prune masked prefix tokens `[0 : bwd_start]` (`T_v = 112` at `T = 128, skip_first = 16`), holding ALL `K = 2560` cotangents in ONE in-place GPU buffer (`5.47 GiB`, `+0.78 GiB` VRAM headroom) while preserving 128-wide MoE/projection/FlashQLA tiling -> **1× backward weight sweep/prompt** (40×–120× less PCIe/NVMe traffic!). |
+| **Fused Active-Expert MoE VJP (`grouped_mm` + Triton)** | Each layer dequantizes ONLY hit experts **ONCE** via a custom 128×128 Triton FP8 kernel (native FP8 on SM89+ and uint8+LUT on SM80 A100), passes zero-copy transposed views into CUTLASS/cuBLAS `grouped_mm`, fuses SwiGLU backward in Triton, and computes the exact top-k softmax router VJP via batched `bmm` (`~0.07 GiB` scratch vs `6.84 GiB`). |
 | **Zero-RAM 51B PLE Mmap / Pre-Extraction** | `MADV_RANDOM` mmap directly on PLE safetensors shards (`0 GiB` VRAM, `0 GiB` pinned RAM, `< 2 ms`/prompt), with automatic two-stage pre-extraction (`~64 MB`) if disk is tight. |
-| **Interleaved 3-Tier Async Double-Buffering** | Permanently pins dense BF16 (`8.2 GiB`) + max MoE layers in **Tier 0 GPU HBM**, spills to **Tier 1 Pinned/Pageable RAM**, and (on A100 40G) interleaves **Tier 2 contiguous NVMe slabs** every ~2.4 layers so background NVMe preads & H2D DMAs hide **100% behind backward compute**! |
+| **Interleaved 3-Tier Async Double-Buffering + Auto VRAM Self-Heal** | Permanently pins dense BF16 (`8.0 GiB`) + max MoE layers in **Tier 0 GPU HBM**, spills to **Tier 1 Pinned/Pageable RAM**, and (on A100 40G) interleaves **Tier 2 contiguous NVMe slabs** so background NVMe preads & H2D DMAs hide **100% behind backward compute**. After loading, `ensure_vram_headroom` verifies live free VRAM and auto-demotes Tier-0 layers to pinned RAM if headroom is ever below the runtime reserve. |
 | **Hardware-Optimal Kernels** | **G4 Blackwell (SM120)**: `FlashQLA v0.1.3` (TileLang SM120 fused GDN fwd+bwd). **A100 (SM80)**: `FLA` Triton fused GDN fwd+bwd. **QSA (all GPUs)**: exact indexer bypass for `T ≤ 2048` + L2-cached exact `B=1` attention VJP (cuBLAS batched GEMMs). |
 
 ---
 
 ### Concrete Auto-Planned Profiles (Default `T = 128`, `Qwen/Qwen3.8-Flash-Next-FP8`)
-| Colab Runtime | GPU Arch | Tier 0 GPU HBM | Tier 1 Host RAM | Tier 2 NVMe Slabs | GDN Kernel | Est. Speed |
-|---|---|---|---|---|---|---|
-| **G4 High RAM** (95.6 GiB / 177 GiB RAM) | SM120 | 8.2G dense + **26 MoE layers** | **22 MoE layers** (pinned, interleaved) | **0 layers** | **FlashQLA SM120** | **~7–10 s/prompt** |
-| **A100 80G High RAM** (79.2 GiB / 167 GiB RAM) | SM80 | 8.2G dense + **19 MoE layers** | **29 MoE layers** (pinned, interleaved) | **0 layers** | **FLA Triton SM80** | **~18–22 s/prompt** |
-| **A100 40G High RAM** (39.6 GiB / 83.5 GiB RAM) | SM80 | 8.2G dense + **5 MoE layers** | **23 MoE layers** (14 pin + 9 page) | **20 MoE layers** (interleaved) | **FLA Triton SM80** | **~22–28 s/prompt** |
+| Colab Runtime | GPU Arch | Tier 0 GPU HBM | Tier 1 Host RAM | Tier 2 NVMe Slabs | Dequant Chunk | GDN Kernel | Est. Speed |
+|---|---|---|---|---|---|---|---|
+| **G4 High RAM** (95.6 GiB / 177 GiB RAM) | SM120 | 8.0G dense + **25 MoE layers** | **23 MoE layers** (pinned, interleaved) | **0 layers** | 512 | **FlashQLA SM120** | **~7–10 s/prompt** |
+| **A100 80G High RAM** (79.2 GiB / 167 GiB RAM) | SM80 | 8.0G dense + **19 MoE layers** | **29 MoE layers** (pinned, interleaved) | **0 layers** | 256 | **FLA Triton SM80** | **~18–22 s/prompt** |
+| **A100 40G High RAM** (39.6 GiB / 83.5 GiB RAM) | SM80 | 8.0G dense + **3 MoE layers** | **23 MoE layers** (14 pin + 9 page) | **22 MoE layers** (interleaved) | 256 | **FLA Triton SM80** | **~22–28 s/prompt** |
 """
         )
     )
@@ -138,7 +134,7 @@ Clean **split-role persistence** (never wastes outbound bandwidth uploading to b
    - Stores running mean `J_mean = jacobian_sum / n_done` in a single `.safetensors` file (`float32` = `4.69 GiB` bit-exact resume by default for Google AI Pro 5 TB Drive; `float16` = `2.34 GiB` available for free 15 GB Drive).
    - Background Drive copy + `convergence.csv` mirror run on a worker thread with **0 s GPU stall** and zero HF commit-rate-limit exposure.
    - Any interrupted checkpoint is immediately loadable via `Qwen38JacobianLens.load(ckpt_path)` and auto-resumes seamlessly across disconnects.
-2. **After fitting (or merging shards) → One-Shot Neuronpedia-Ready Publish to Hugging Face Hub (Cell 9)**:
+2. **After fitting (or merging shards) → One-Shot Neuronpedia-Ready Publish to Hugging Face Hub (Section 9)**:
    - Exports `Qwen3.8-Flash-Next-FP8_jacobian_lens.pt` (`fp16`, Neuronpedia drop-in schema + `provenance`), `Qwen3.8-Flash-Next-FP8_jacobian_lens_4branch.safetensors` (full lossless 4-branch `[2560, 10240]`), `convergence.csv`, `config.yaml`, and `CREDIT.md`, then uploads the folder in **one single clean commit**."""
         )
     )
@@ -165,7 +161,7 @@ CHECKPOINT_EVERY_PROMPTS = 15 #@param {type:"integer"}        # Trigger checkpoi
 CHECKPOINT_EVERY_MINUTES = 10.0 #@param {type:"number"}       # OR every M minutes (whichever comes first)
 LOCAL_WORK_DIR = "/content/qwen38_work" #@param {type:"string"}
 
-#@markdown ### After Fitting: One-Shot Neuronpedia-Ready Publish to Hugging Face Hub (Cell 9)
+#@markdown ### After Fitting: One-Shot Neuronpedia-Ready Publish to Hugging Face Hub (Section 9)
 HF_PUBLISH_REPO = ""         #@param {type:"string"}          # e.g. "your-username/qwen3.8-flash-next-jlens" (single clean commit at the end!)
 HF_PUBLISH_PRIVATE = False   #@param {type:"boolean"}
 AUTHOR_NAME = ""             #@param {type:"string"}          # Recorded in CREDIT.md, config.yaml, and .pt provenance
@@ -217,37 +213,58 @@ print(f"  Mid-run Google Drive  : {DRIVE_CKPT_PATH or 'disabled'} (async backgro
 print(f"  Convergence CSV       : {DRIVE_CONV_CSV or LOCAL_CONV_CSV}")
 print(f"  Checkpoint Cadence    : every {CHECKPOINT_EVERY_PROMPTS} prompts or {CHECKPOINT_EVERY_MINUTES} min")
 print(f"  Final Release Bundle  : {BUNDLE_DIR}")
-print(f"  One-Shot HF Publish   : {f'{HF_PUBLISH_REPO}/{BUNDLE_REL_DIR}' if HF_PUBLISH_REPO else 'not set (configure HF_PUBLISH_REPO for Cell 9)'}")
+print(f"  One-Shot HF Publish   : {f'{HF_PUBLISH_REPO}/{BUNDLE_REL_DIR}' if HF_PUBLISH_REPO else 'not set (configure HF_PUBLISH_REPO for Section 9)'}")
 """
         )
     )
 
     # ------------------------------------------------------------------ #
-    # Cells 3..10: Self-Contained Verified Engine Modules
+    # Section 3: Direct Clone / Editable Install & Import from Public GitHub Repo
     # ------------------------------------------------------------------ #
     cells.append(
         new_markdown_cell(
-            """## 3. Install Self-Contained `qwen38_jlens` Engine Modules
-Writing the verified, modular engine directly into `/content/qwen38_jlens/` so this notebook runs 100% standalone on Colab without needing external repo clones."""
+            f"""## 3. Clone / Update & Import `qwen38_jlens`
+Clones (or fast-forwards) the public repository [`xiayicheng3-code/Qwen3.8FlashNextJ-lens`]({REPO_URL[:-4]}) and installs `qwen38_jlens` in editable mode (`--no-deps`) for direct import."""
         )
     )
-    cells.append(new_code_cell("import os\nos.makedirs('qwen38_jlens', exist_ok=True)\n"))
+    cells.append(
+        new_code_cell(
+            f"""import importlib, subprocess, sys
+from pathlib import Path
 
-    module_order = [
-        ("hardware.py", "Hardware Auto-Detection & Concrete 3-Tier Interleaved Offloading Planner"),
-        ("ple_mmap.py", "Zero-RAM 51B PLE N-Gram Mmap Table & Exact Hasher"),
-        ("kernels.py", "GPU Kernels: FlashQLA (SM120/90), FLA (SM80), Triton FP8 Block-128 Dequant & SwiGLU VJP, grouped_mm"),
-        ("model_ops.py", "Exact Qwen3.8-Flash-Next (qwen4_exp) Forward & Batched-Cotangent Analytical VJP Operators"),
-        ("loader.py", "Streaming Shard-by-Shard Safetensors Packer & 3-Tier MoE Slab Manager"),
-        ("checkpoint.py", "Crash-Proof Zero-GPU-Stall Async Checkpointer (Safetensors + Google Drive + HF Hub)"),
-        ("lens.py", "Qwen38JacobianLens Container, 4-Branch Diagnostics & Interactive Slice Renderer"),
-        ("engine.py", "Async Double-Buffered 3-Tier MoE Streamer & Single-Sweep Layer-by-Layer J-Lens Engine"),
-        ("__init__.py", "Package Exports"),
-    ]
-    for mod_name, title in module_order:
-        code = _read_module(mod_name)
-        ast.parse(code, filename=mod_name)
-        cells.append(new_code_cell(f"%%writefile qwen38_jlens/{mod_name}\n{code}"))
+REPO_URL = "{REPO_URL}"
+REPO_BRANCH = "main"
+USE_LOCAL_CWD = (Path.cwd() / "qwen38_jlens" / "__init__.py").is_file()
+LOCAL_REPO = Path.cwd() if USE_LOCAL_CWD else Path("/content/Qwen3.8FlashNextJ-lens")
+
+if not USE_LOCAL_CWD:
+    if (LOCAL_REPO / ".git").is_dir():
+        subprocess.run(["git", "-C", str(LOCAL_REPO), "fetch", "--depth", "1", "origin", REPO_BRANCH], check=True)
+        subprocess.run(["git", "-C", str(LOCAL_REPO), "reset", "--hard", f"origin/{{REPO_BRANCH}}"], check=True)
+    else:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", REPO_BRANCH, REPO_URL, str(LOCAL_REPO)],
+            check=True,
+        )
+
+if str(LOCAL_REPO) not in sys.path:
+    sys.path.insert(0, str(LOCAL_REPO))
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "-e", str(LOCAL_REPO)], check=True)
+
+# If re-running after a git pull, clear cached qwen38_jlens modules so fresh code is imported cleanly
+for _m in [k for k in list(sys.modules) if k == "qwen38_jlens" or k.startswith("qwen38_jlens.")]:
+    del sys.modules[_m]
+importlib.invalidate_caches()
+
+import qwen38_jlens
+
+rev = subprocess.check_output(
+    ["git", "-C", str(LOCAL_REPO), "log", "-1", "--format=%h %s"], text=True
+).strip() if (LOCAL_REPO / ".git").is_dir() else "local"
+print(f"Loaded qwen38_jlens from {{Path(qwen38_jlens.__file__).parent}} ({{rev}})")
+"""
+        )
+    )
 
     # ------------------------------------------------------------------ #
     # Cell 11: Live Hardware Probe, Concrete Offload Plan & Kernel Micro-Benchmark
@@ -341,6 +358,11 @@ del _dA, _dg, _du, _sw_tri, _sw_ref
 K_blk = plan.moe_k_chunk
 S_rows = 128 * 10
 counts = torch.full((E_act,), max(1, S_rows // E_act), device=dev, dtype=torch.int32)
+offs_fwd = torch.cumsum(counts, dim=0, dtype=torch.int32)
+_x_fwd = torch.randn(int(offs_fwd[-1].item()), 2560, device=dev, dtype=torch.bfloat16)
+_ = grouped_mm(_x_fwd, w_bf16.transpose(-2, -1), offs_fwd)
+del offs_fwd, _x_fwd
+
 offs_K = torch.cumsum(counts * K_blk, dim=0, dtype=torch.int32)
 M_tot = int(offs_K[-1].item())
 dGU = torch.randn(M_tot, 1280, device=dev, dtype=torch.bfloat16)
@@ -352,7 +374,7 @@ for _ in range(3):
 torch.cuda.synchronize()
 dt_gmm = (time.perf_counter() - t0) / 3
 tflops = (2.0 * M_tot * 1280 * 2560) / dt_gmm / 1e12
-print(f"  [OK] MoE grouped_mm VJP (M={M_tot}, K=1280, N=2560): {dt_gmm*1e3:.2f} ms ({tflops:.1f} TFLOPS)")
+print(f"  [OK] MoE grouped_mm fwd(T-view)+VJP (M={M_tot}, K=1280, N=2560): {dt_gmm*1e3:.2f} ms ({tflops:.1f} TFLOPS)")
 
 del w_fp8, s_fp32, w_bf16, dGU, out_gmm
 torch.cuda.empty_cache()
@@ -433,15 +455,25 @@ print(f"Prepared {len(tokenized_prompts)} WikiText prompts (offset={PROMPT_OFFSE
         new_markdown_cell(
             """## 6. Stream-Load `Qwen/Qwen3.8-Flash-Next-FP8` Directly Into the 3-Tier Hierarchy
 - Skips Vision encoder and MTP shards automatically.
-- Loads all dense BF16 weights (`~8.2 GiB`) directly to GPU (immune to `transformers#48349`).
+- Loads all dense BF16 weights (`~8.0 GiB`) directly to GPU (immune to `transformers#48349`).
 - Keeps 51B PLE n-gram table out of RAM (`MADV_RANDOM` NVMe mmap or tight-disk pre-extraction).
-- Unpacks each raw safetensors shard straight into **Tier 0 GPU HBM / Tier 1 Pinned+Pageable RAM / Tier 2 contiguous NVMe slabs**, evicting raw HF blobs immediately so Colab disk stays well below 235 GiB."""
+- Unpacks each raw safetensors shard straight into **Tier 0 GPU HBM / Tier 1 Pinned+Pageable RAM / Tier 2 contiguous NVMe slabs** and prints a live per-component VRAM breakdown (auto-demoting Tier-0 layers to pinned RAM if live free VRAM is ever below the runtime reserve)."""
         )
     )
     cells.append(
         new_code_cell(
-            """import shutil, time, psutil, torch
+            """import gc, shutil, time, psutil, torch
 from qwen38_jlens import Qwen38JLensEngine, load_qwen38_streaming
+
+# Release any previously loaded engine/model if re-running this cell in the same session
+for _old_name in ("engine", "loaded_model"):
+    if _old_name in globals():
+        _obj = globals().pop(_old_name)
+        if hasattr(_obj, "close"):
+            _obj.close()
+        del _obj
+gc.collect()
+torch.cuda.empty_cache()
 
 t_load = time.perf_counter()
 loaded_model = load_qwen38_streaming(
@@ -456,12 +488,20 @@ loaded_model = load_qwen38_streaming(
 )
 engine = Qwen38JLensEngine(loaded_model)
 
-vram_used = torch.cuda.memory_allocated() / 1024**3
+vb = engine.vram_breakdown()
 ram_used = psutil.virtual_memory().used / 1024**3
 disk_free = shutil.disk_usage(LOCAL_WORK_DIR).free / 1024**3
 print(f"\\nReady for J-Lens fitting in {time.perf_counter()-t_load:.1f}s!")
-print(f"  Active GDN Kernel : {engine.gdn_backend.name} (direct={engine.gdn_backend._use_direct})")
-print(f"  Live Telemetry    : VRAM alloc={vram_used:.1f} GiB | RAM used={ram_used:.1f} GiB | Disk free={disk_free:.1f} GiB")
+print(f"  Active GDN Kernel  : {engine.gdn_backend.name} (direct={engine.gdn_backend._use_direct})")
+if engine.demoted_layers:
+    print(f"  VRAM Self-Heal     : auto-demoted {len(engine.demoted_layers)} Tier-0 layers -> pinned RAM: {engine.demoted_layers}")
+print(
+    f"  Live VRAM Breakdown: dense={vb['dense_gib']:.2f}G + tier0_moe={vb['tier0_moe_gib']:.2f}G "
+    f"+ staging={vb['staging_gib']:.2f}G | alloc={vb['allocated_gib']:.2f}G "
+    f"| reserved={vb['reserved_gib']:.2f}G | free={vb['free_gib']:.2f}/{vb['total_gib']:.1f}G "
+    f"(reserve={engine.plan.runtime_vram_reserve_gib:.1f}G)"
+)
+print(f"  Live Host Telemetry: RAM used={ram_used:.1f} GiB | Disk free={disk_free:.1f} GiB")
 """
         )
     )
@@ -570,7 +610,7 @@ bundle_files = export_neuronpedia_bundle(
     stop_at_delta=(STOP_AT_DELTA if STOP_AT_DELTA > 0 else None),
     convergence_csv_path=LOCAL_CONV_CSV,
     gpu_name=profile.gpu_name,
-    gpu_vram_gib=profile.gpu_vram_total_gib,
+    gpu_vram_gib=profile.vram_total_gib,
     gdn_kernel=engine.gdn_backend.name,
     include_4branch_safetensors=True,
 )
@@ -685,7 +725,7 @@ PUBLISH_LENS = lens
 #     max_seq_len=MAX_SEQ_LEN,
 #     skip_first=SKIP_FIRST,
 #     gpu_name=profile.gpu_name,
-#     gpu_vram_gib=profile.gpu_vram_total_gib,
+#     gpu_vram_gib=profile.vram_total_gib,
 #     gdn_kernel=engine.gdn_backend.name,
 # )
 # print("Exported merged Neuronpedia bundle:", PUBLISH_DIR, merged_lens)
@@ -710,6 +750,9 @@ else:
 """
         )
     )
+
+    for i, cell in enumerate(cells):
+        cell["id"] = f"q38-cell-{i:02d}"
 
     nb = new_notebook(
         cells=cells,

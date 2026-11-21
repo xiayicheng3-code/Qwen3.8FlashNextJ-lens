@@ -124,6 +124,10 @@ class OffloadPlan:
     est_vram_peak_gib: float = 0.0
     est_ram_peak_gib: float = 0.0
     est_disk_peak_gib: float = 0.0
+    # Free VRAM (GiB) that must remain AFTER weights load, excluding GPU staging slots:
+    # G_curr + Stage-A MoE VJP scratch + BF16 expert dequant buffer + safety margin. Used by
+    # `Qwen38JLensEngine` to self-heal (demote Tier-0 layers) if the live runtime has less headroom.
+    runtime_vram_reserve_gib: float = 0.0
     notes: list[str] = field(default_factory=list)
 
     def tier_counts(self) -> dict[StorageTier, int]:
@@ -158,6 +162,7 @@ class OffloadPlan:
             f"   MoE VJP Kernel  : {self.moe_backend} | Triton FP8 dequant={self.use_triton_fp8_dequant} | Triton SwiGLU={self.use_triton_swiglu_vjp}",
             f"   Weight Sweeps   : {n_sweeps}x/prompt (k_pass={self.k_pass}, attn_k_chunk={self.attn_k_chunk}, moe_k_chunk={self.moe_k_chunk}, expert_dequant_chunk={self.expert_dequant_chunk})",
             f"   Est. Peak Usage : VRAM ~{self.est_vram_peak_gib:.1f} GiB | RAM ~{self.est_ram_peak_gib:.1f} GiB | Disk ~{self.est_disk_peak_gib:.1f} GiB",
+            f"   Runtime Reserve : {self.runtime_vram_reserve_gib:.1f} GiB free VRAM required after load (+ staging slots; auto-enforced)",
             "========================================================================",
         ]
         if self.notes:
@@ -326,7 +331,13 @@ def build_offload_plan(
     if vram_usable >= 70.0:
         attn_k_chunk = 128
         moe_k_chunk = 256
-        expert_dequant_chunk = num_experts  # Dequantize all active experts in 1 shot (~3.8-4.7 GiB max)
+        if vram_usable >= 88.0:
+            # G4 96G: dequantize all active experts in 1 shot (~4.2-4.7 GiB BF16), reused across all K.
+            expert_dequant_chunk = num_experts
+        else:
+            # A100/H100 80G: 256-expert chunks halve the BF16 buffer (4.69 -> 2.35 GiB) while every
+            # active expert is STILL dequantized once per backward layer (expert loop is outside K loop).
+            expert_dequant_chunk = min(num_experts, 256)
         vram_safety_gib = 6.0
     elif vram_usable >= 34.0:
         # Colab A100 40G profile
@@ -350,13 +361,17 @@ def build_offload_plan(
         * (num_experts * 3 * moe_intermediate_size * d_model * 2)
         / (1024**3)
     )
-    # Scratch for GDN/QSA + MoE VJP intermediates (d_y_mlp_TK + d_x_mlp_TK + grouped_mm chunk temps)
+    # Stage-A (MoE) scratch, live simultaneously with G_curr + the BF16 dequant buffer:
+    #   - d_y_mlp_TK + d_x_mlp_TK ([T, K, D] BF16 each)
+    #   - routed grouped-GEMM chunk temps: max(dy_s + dA, dGU + dX_s) <= S*K_blk*(D + 2*inter)*2B
+    #   - shared/router VJP temps run in 64-wide K chunks (< 0.1 GiB, covered by the safety margin)
     s_pairs = max_seq_len * 10
     d_mlp_tk_gib = (2 * k_pass * max_seq_len * d_model * 2) / (1024**3)
     moe_chunk_gib = (s_pairs * moe_k_chunk * (d_model + 2 * moe_intermediate_size) * 2) / (1024**3)
     moe_scratch_gib = d_mlp_tk_gib + moe_chunk_gib
     attn_scratch_gib = max(0.8, (attn_k_chunk * max_seq_len * 48 * 128 * 10 * 2) / (1024**3))
     compute_scratch_gib = max(moe_scratch_gib, attn_scratch_gib)
+    runtime_vram_reserve_gib = g_curr_gib + dequant_bf16_gib + compute_scratch_gib + vram_safety_gib
 
     # Check if ALL layers fit directly in GPU HBM (no staging slots needed)
     all_gpu_vram = (
@@ -541,5 +556,6 @@ def build_offload_plan(
         est_vram_peak_gib=est_vram_peak,
         est_ram_peak_gib=est_ram_peak,
         est_disk_peak_gib=est_disk_peak,
+        runtime_vram_reserve_gib=runtime_vram_reserve_gib if profile.has_cuda else 0.0,
         notes=notes,
     )
