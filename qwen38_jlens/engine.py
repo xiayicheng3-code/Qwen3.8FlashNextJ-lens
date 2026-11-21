@@ -584,12 +584,13 @@ class Qwen38JLensEngine:
             # then immediately backprop through hyper_connection_mixer -> G_{L-1} [K_cur, T_v, D_hc]!
             G: torch.Tensor | None = torch.zeros((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
             try:
+                hc_k_chunk = min(64, self.plan.moe_k_chunk, K_cur)
                 d_target_chunk = torch.zeros(
-                    (min(self.plan.moe_k_chunk, K_cur), T_v, D), device=self.device, dtype=self.dtype
+                    (hc_k_chunk, T_v, D), device=self.device, dtype=self.dtype
                 )
-                k_sub_idx = torch.arange(d_target_chunk.shape[0], device=self.device)
-                for c0 in range(0, K_cur, d_target_chunk.shape[0]):
-                    c1 = min(c0 + d_target_chunk.shape[0], K_cur)
+                k_sub_idx = torch.arange(hc_k_chunk, device=self.device)
+                for c0 in range(0, K_cur, hc_k_chunk):
+                    c1 = min(c0 + hc_k_chunk, K_cur)
                     nc = c1 - c0
                     d_target_chunk[:nc].zero_()
                     d_target_chunk[

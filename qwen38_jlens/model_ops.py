@@ -169,16 +169,20 @@ def rmsnorm_vjp(
     weight: torch.Tensor,  # [D]
     group_size: int | None = None,
 ) -> torch.Tensor:
-    """Exact batched-cotangent VJP of Qwen4ExpTextRMSNorm."""
+    """Exact batched-cotangent VJP of Qwen4ExpTextRMSNorm (low-VRAM in-place fp32 math)."""
     orig_dy_shape = dy.shape
-    dyf = dy.float()
+    g = dy.to(torch.float32, copy=True)
     wf = 1.0 + weight.float()
     if group_size is not None:
-        dyf = dyf.reshape(*orig_dy_shape[:-1], -1, group_size)
+        g = g.reshape(*orig_dy_shape[:-1], -1, group_size)
         wf = wf.reshape(-1, group_size)
-    g = dyf * wf
+    g.mul_(wf)
     dot = (g * x_hat).mean(dim=-1, keepdim=True)
-    dx = (rstd * (g - x_hat * dot)).to(dy.dtype)
+    g.addcmul_(x_hat, dot, value=-1.0)
+    del dot
+    g.mul_(rstd)
+    dx = g.to(dy.dtype)
+    del g
     if group_size is not None:
         dx = dx.reshape(orig_dy_shape)
     return dx
@@ -222,13 +226,17 @@ def rmsnorm_gated_vjp(
     dy: torch.Tensor,  # [K, T, H_v, D_v]
     saved: dict[str, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact VJP of Qwen4ExpTextRMSNormGated -> `(dx, dgate)`."""
-    dyf = dy.float()
+    """Exact VJP of Qwen4ExpTextRMSNormGated -> `(dx, dgate)` (low-VRAM in-place fp32 math)."""
+    dyf = dy.to(torch.float32, copy=True)
     d_gate = (dyf * saved["normed"] * saved["d_act_g"]).to(dy.dtype)
-    g = dyf * saved["act_g"] * saved["weight_f"]
+    dyf.mul_(saved["act_g"]).mul_(saved["weight_f"])
     x_hat_f = saved["x_hat_f"]
-    dot = (g * x_hat_f).mean(dim=-1, keepdim=True)
-    dx = (saved["rstd"] * (g - x_hat_f * dot)).to(dy.dtype)
+    dot = (dyf * x_hat_f).mean(dim=-1, keepdim=True)
+    dyf.addcmul_(x_hat_f, dot, value=-1.0)
+    del dot
+    dyf.mul_(saved["rstd"])
+    dx = dyf.to(dy.dtype)
+    del dyf
     return dx, d_gate
 
 
@@ -290,14 +298,19 @@ def gated_residual_vjp(
 
     # Gate branch through m = sigmoid(W_up(silu(W_down(h_norm) / hc)))
     d_u2 = (d_prod * saved["h_norm_4"] * saved["dm_du2"]).flatten(-2)  # [K, T, hc*D]
+    del d_prod
     d_s1 = torch.matmul(d_u2, w.input_mix_weight_up)  # [K, T, hc_lowrank]
+    del d_u2
     d_u1 = d_s1 * saved["d_silu_u1"]
-    d_h_norm = d_h_norm + torch.matmul(d_u1 * inv_hc, w.input_mix_weight_down)
+    del d_s1
+    d_h_norm.add_(torch.matmul(d_u1 * inv_hc, w.input_mix_weight_down))
+    del d_u1
 
     # Injection gate branch
     if d_inj is not None and w.block_inject_weight is not None:
         d_u3 = d_inj * saved["d_inj_u3"]  # [K, T, hc_count]
-        d_h_norm = d_h_norm + torch.matmul(d_u3 * inv_hc, w.block_inject_weight)
+        d_h_norm.add_(torch.matmul(d_u3 * inv_hc, w.block_inject_weight))
+        del d_u3
 
     return rmsnorm_vjp(d_h_norm, saved["x_hat"], saved["rstd"], w.hc_norm_weight, group_size=w.hidden_size)
 
@@ -1216,8 +1229,9 @@ def decoder_layer_vjp_inplace(
     saved["moe_saved"]["cached_W_gu"] = None
     saved["moe_saved"]["cached_W_dn"] = None
 
-    for k0 in range(0, K_total, moe_k_chunk):
-        k1 = min(k0 + moe_k_chunk, K_total)
+    hc_k_chunk = min(64, moe_k_chunk)
+    for k0 in range(0, K_total, hc_k_chunk):
+        k1 = min(k0 + hc_k_chunk, K_total)
         G[k0:k1].add_(
             gated_residual_vjp(
                 d_x_mlp_TK[:, k0:k1, :].transpose(0, 1),
@@ -1231,11 +1245,13 @@ def decoder_layer_vjp_inplace(
     # ---- Stage B: Attention Injection + Token Mixer (GDN/QSA) + Attn Hyper-Connection ----
     y_attn = saved["y_attn"]  # [T_v, D]
     w_attn = saved["w_attn"]  # [T_v, hc]
+    attn_hc_step = min(64, attn_k_chunk)
     for k0 in range(0, K_total, attn_k_chunk):
         k1 = min(k0 + attn_k_chunk, K_total)
         g4 = G[k0:k1].view(k1 - k0, T_v, hc, D)
         d_y_attn = (g4 * w_attn[None, :, :, None]).sum(dim=2)
         d_w_attn = (g4.float() * y_attn.float()[None, :, None, :]).sum(dim=-1).to(G.dtype)
+        del g4
 
         if layer_w.layer_type == "linear_attention":
             assert layer_w.gdn is not None
@@ -1247,16 +1263,23 @@ def decoder_layer_vjp_inplace(
             d_x_attn = qsa_layer_vjp(
                 d_y_attn, layer_w.qsa, saved["mixer_saved"], bwd_start=bwd_start
             )
+        del d_y_attn
 
-        G[k0:k1].add_(
-            gated_residual_vjp(d_x_attn, d_w_attn, layer_w.attn_hc, saved["attn_hc_saved"])
-        )
+        for s0 in range(0, k1 - k0, attn_hc_step):
+            s1 = min(s0 + attn_hc_step, k1 - k0)
+            G[k0 + s0 : k0 + s1].add_(
+                gated_residual_vjp(
+                    d_x_attn[s0:s1], d_w_attn[s0:s1], layer_w.attn_hc, saved["attn_hc_saved"]
+                )
+            )
+        del d_x_attn, d_w_attn
 
     # ---- Stage C: Optional PLE Layer Backward (layer 2 only, already sliced to [bwd_start:]) ----
     if layer_w.ple is not None:
         ple_saved = saved["ple_saved"]
-        for k0 in range(0, K_total, attn_k_chunk):
-            k1 = min(k0 + attn_k_chunk, K_total)
+        ple_step = min(64, attn_k_chunk)
+        for k0 in range(0, K_total, ple_step):
+            k1 = min(k0 + ple_step, K_total)
             G[k0:k1].add_(ple_layer_vjp(G[k0:k1], layer_w.ple, ple_saved))
 
     return G

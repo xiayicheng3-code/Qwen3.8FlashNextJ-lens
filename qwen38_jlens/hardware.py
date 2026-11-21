@@ -327,13 +327,13 @@ def build_offload_plan(
         attn_k_chunk = 128
         moe_k_chunk = 256
         expert_dequant_chunk = num_experts  # Dequantize all active experts in 1 shot (~3.8-4.7 GiB max)
-        vram_safety_gib = 4.0
+        vram_safety_gib = 6.0
     elif vram_usable >= 34.0:
         # Colab A100 40G profile
         attn_k_chunk = 64
         moe_k_chunk = 128
         expert_dequant_chunk = min(num_experts, 256)  # Chunked BF16 dequant caps peak scratch at 2.35 GiB
-        vram_safety_gib = 3.5
+        vram_safety_gib = 4.0
     else:
         attn_k_chunk = 32
         moe_k_chunk = 64
@@ -350,10 +350,11 @@ def build_offload_plan(
         * (num_experts * 3 * moe_intermediate_size * d_model * 2)
         / (1024**3)
     )
-    # Scratch for GDN/QSA + MoE VJP intermediates
-    # MoE VJP peak: ~ (S * moe_k_chunk * (2*D + 3*inter) * 2B) where S = max_seq_len * 10
+    # Scratch for GDN/QSA + MoE VJP intermediates (d_y_mlp_TK + d_x_mlp_TK + grouped_mm chunk temps)
     s_pairs = max_seq_len * 10
-    moe_scratch_gib = (s_pairs * moe_k_chunk * (2 * d_model + 3 * moe_intermediate_size) * 2) / (1024**3)
+    d_mlp_tk_gib = (2 * k_pass * max_seq_len * d_model * 2) / (1024**3)
+    moe_chunk_gib = (s_pairs * moe_k_chunk * (d_model + 2 * moe_intermediate_size) * 2) / (1024**3)
+    moe_scratch_gib = d_mlp_tk_gib + moe_chunk_gib
     attn_scratch_gib = max(0.8, (attn_k_chunk * max_seq_len * 48 * 128 * 10 * 2) / (1024**3))
     compute_scratch_gib = max(moe_scratch_gib, attn_scratch_gib)
 

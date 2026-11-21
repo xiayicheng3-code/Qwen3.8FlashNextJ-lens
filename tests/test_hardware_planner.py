@@ -80,7 +80,7 @@ def test_colab_a100_40g_plan_and_nvme_interleaving():
     assert plan.gdn_backend == "fla"
     assert plan.k_pass == 2560  # Single weight sweep even on A100 40G!
     assert plan.expert_dequant_chunk == 256  # Chunked BF16 dequant caps peak scratch!
-    assert counts[StorageTier.GPU_HBM] >= 4
+    assert counts[StorageTier.GPU_HBM] >= 3
     assert counts[StorageTier.NVME_SLAB] > 0  # Safely spills overflow to interleaved NVMe slabs (zero RAM OOM!)
     assert sum(counts.values()) == 48
     assert plan.est_vram_peak_gib < a100_40.vram_free_gib
