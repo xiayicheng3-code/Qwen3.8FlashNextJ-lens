@@ -479,7 +479,7 @@ print(f"  Live Telemetry    : VRAM alloc={vram_used:.1f} GiB | RAM used={ram_use
     )
     cells.append(
         new_code_cell(
-            """import os, time, torch
+            """import gc, os, sys, time, torch
 from tqdm.auto import tqdm
 from qwen38_jlens import (
     AsyncCheckpointManager,
@@ -487,6 +487,13 @@ from qwen38_jlens import (
     export_neuronpedia_bundle,
     peek_checkpoint_metadata,
 )
+
+# Clear any GPU tensors trapped in stale Jupyter tracebacks from earlier interrupted runs
+sys.last_traceback = None
+if hasattr(sys, "last_exc"):
+    sys.last_exc = None
+gc.collect()
+torch.cuda.empty_cache()
 
 ckpt_mgr = AsyncCheckpointManager(
     CheckpointConfig(

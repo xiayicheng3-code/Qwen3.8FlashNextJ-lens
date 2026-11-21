@@ -899,7 +899,7 @@ def moe_block_fwd(
 
 
 def moe_block_vjp_all(
-    d_out_all: torch.Tensor,  # [K_total, T, D]
+    d_out_all: torch.Tensor,  # [K_total, T, D] (or [T, K_total, D] when tk_layout=True)
     dense: MoeDenseWeights,
     experts: MoeExpertPayload,
     saved: dict[str, Any],
@@ -908,6 +908,7 @@ def moe_block_vjp_all(
     dequant_chunk_size: int = 512,
     use_triton_dequant: bool = True,
     use_triton_swiglu: bool = True,
+    tk_layout: bool = False,
 ) -> torch.Tensor:
     """Exact VJP of `Qwen4ExpTextSparseMoeBlock` across ALL `K_total` cotangents.
 
@@ -918,9 +919,17 @@ def moe_block_vjp_all(
       - When `E_hit > dequant_chunk_size` (A100-40G chunked mode): loops over expert chunks
         OUTSIDE the `K` loop so EVERY active expert is STILL dequantized ONLY ONCE across
         all `K_total = 2560` cotangents!!
+      - When `tk_layout=True`: accepts `[T, K_total, D]` directly and returns `[T, K_total, D]`,
+        eliminating two full 1.37 GiB `[K, T, D] <-> [T, K, D]` transpose copies!
     """
-    K_total, T, D = d_out_all.shape
-    dtype = d_out_all.dtype
+    if tk_layout:
+        T, K_total, D = d_out_all.shape
+        dY_TK = d_out_all
+    else:
+        K_total, T, D = d_out_all.shape
+        # Transpose to [T, K_total, D] for O(1) token gather into expert-grouped layout [S, K_blk, D]
+        dY_TK = d_out_all.transpose(0, 1).contiguous()
+    dtype = dY_TK.dtype
     top_k = dense.top_k
     S = saved["S"]
     E_hit = saved["E_hit"]
@@ -930,8 +939,6 @@ def moe_block_vjp_all(
     w_sorted = saved["w_sorted"]
     inv_perm = saved["inv_perm"]
 
-    # Transpose to [T, K_total, D] for O(1) token gather into expert-grouped layout [S, K_blk, D]
-    dY_TK = d_out_all.transpose(0, 1).contiguous()  # [T, K_total, D]
     dX_TK = torch.zeros_like(dY_TK)
 
     # 1. Shared expert + router VJP (tiny dense BF16 ops -> run in K chunks, < 1 ms total)
@@ -967,6 +974,7 @@ def moe_block_vjp_all(
         # dw_sorted[s, k] = <dY[tok(s), k, :], y_exp_sorted[s, :]>
         dy_sorted_raw = dy_tk[tok_of_sorted]  # [S, K_blk, D]
         dw_sorted = (dy_sorted_raw.float() * y_exp_sorted.float().unsqueeze(1)).sum(dim=-1)  # [S, K_blk]
+        del dy_sorted_raw
         dw = dw_sorted[inv_perm].view(T, top_k, k1 - k0).transpose(1, 2)  # [T, K_blk, k] fp32
         if top_sum is not None:
             dot_w = (dw * rw_f.unsqueeze(1)).sum(dim=-1, keepdim=True)
@@ -1029,6 +1037,7 @@ def moe_block_vjp_all(
 
             # Down-proj backward: [n_rows * K_blk, D] @ [E_c, D, r_inter] -> [n_rows * K_blk, r_inter]
             dA = grouped_mm(dy_s.reshape(n_rows * K_blk, D), W_dn, offs_K, offs_K_list).view(n_rows, K_blk, -1)
+            del dy_s
 
             # Fused SwiGLU backward + pack [dG | dU] -> [n_rows * K_blk, 2 * r_inter]
             dGU = swiglu_vjp_pack(dA, sub_dg, sub_du, use_triton=use_triton_swiglu).reshape(n_rows * K_blk, -1)
@@ -1038,18 +1047,20 @@ def moe_block_vjp_all(
             dX_s = grouped_mm(dGU, W_gu, offs_K, offs_K_list).view(n_rows, K_blk, D)
             del dGU
 
-            # Deterministic accumulation back to token axis (no race conditions / atomicAdd!)
+            # Deterministic low-VRAM accumulation back to token axis (0.14 GiB/rank vs 1.37 GiB full gather!)
             if c0 == 0 and c1 == E_hit:
-                # Full-active fast path: direct inv_perm + sum(dim=1) (zero index_add_)
-                dX_TK[:, k0:k1, :].add_(dX_s[inv_perm].view(T, top_k, K_blk, D).sum(dim=1))
+                for r in range(top_k):
+                    dX_TK[:, k0:k1, :].add_(dX_s[inv_perm[r::top_k]])
             else:
-                # Chunked path: accumulate in float32 per token cleanly
                 dX_TK[:, k0:k1, :].index_add_(0, sub_tok, dX_s)
             del dX_s
 
         if pre_W_gu is None:
             del W_gu, W_dn
 
+    if tk_layout:
+        return dX_TK  # [T, K_total, D]
+    del dY_TK
     return dX_TK.transpose(0, 1).contiguous()  # [K_total, T, D]
 
 
@@ -1180,16 +1191,18 @@ def decoder_layer_vjp_inplace(
     y_mlp = saved["y_mlp"]  # [T_v, D]
     w_mlp = saved["w_mlp"]  # [T_v, hc]
 
-    d_y_mlp = torch.empty((K_total, T_v, D), device=G.device, dtype=G.dtype)
+    # Build d_y_mlp_TK directly in [T_v, K_total, D] layout so moe_block_vjp_all needs ZERO transpose copies!
+    d_y_mlp_TK = torch.empty((T_v, K_total, D), device=G.device, dtype=G.dtype)
     d_w_mlp = torch.empty((K_total, T_v, hc), device=G.device, dtype=G.dtype)
-    for k0 in range(0, K_total, moe_k_chunk):
-        k1 = min(k0 + moe_k_chunk, K_total)
+    proj_step = min(64, moe_k_chunk)
+    for k0 in range(0, K_total, proj_step):
+        k1 = min(k0 + proj_step, K_total)
         g4 = G[k0:k1].view(k1 - k0, T_v, hc, D)
-        d_y_mlp[k0:k1] = (g4 * w_mlp[None, :, :, None]).sum(dim=2)
+        d_y_mlp_TK[:, k0:k1, :] = (g4 * w_mlp[None, :, :, None]).sum(dim=2).transpose(0, 1)
         d_w_mlp[k0:k1] = (g4.float() * y_mlp.float()[None, :, None, :]).sum(dim=-1).to(G.dtype)
 
-    d_x_mlp = moe_block_vjp_all(
-        d_y_mlp,
+    d_x_mlp_TK = moe_block_vjp_all(
+        d_y_mlp_TK,
         layer_w.moe_dense,
         experts,
         saved["moe_saved"],
@@ -1197,17 +1210,23 @@ def decoder_layer_vjp_inplace(
         dequant_chunk_size=dequant_chunk_size,
         use_triton_dequant=use_triton_dequant,
         use_triton_swiglu=use_triton_swiglu,
+        tk_layout=True,
     )
-    del d_y_mlp
+    del d_y_mlp_TK
     saved["moe_saved"]["cached_W_gu"] = None
     saved["moe_saved"]["cached_W_dn"] = None
 
     for k0 in range(0, K_total, moe_k_chunk):
         k1 = min(k0 + moe_k_chunk, K_total)
         G[k0:k1].add_(
-            gated_residual_vjp(d_x_mlp[k0:k1], d_w_mlp[k0:k1], layer_w.mlp_hc, saved["mlp_hc_saved"])
+            gated_residual_vjp(
+                d_x_mlp_TK[:, k0:k1, :].transpose(0, 1),
+                d_w_mlp[k0:k1],
+                layer_w.mlp_hc,
+                saved["mlp_hc_saved"],
+            )
         )
-    del d_x_mlp, d_w_mlp
+    del d_x_mlp_TK, d_w_mlp
 
     # ---- Stage B: Attention Injection + Token Mixer (GDN/QSA) + Attn Hyper-Connection ----
     y_attn = saved["y_attn"]  # [T_v, D]

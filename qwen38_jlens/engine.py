@@ -324,6 +324,31 @@ def _move_tensor_dict(d: dict[str, Any], device: torch.device) -> dict[str, Any]
     }
 
 
+def _reduce_valid_mean_cpu(
+    G: torch.Tensor,
+    valid_pos_local: torch.Tensor,
+    *,
+    k_chunk: int = 256,
+) -> torch.Tensor:
+    """Exact fp32 mean over valid positions without allocating a 16.26 GiB fancy-indexed fp32 copy of `G`!
+
+    Previously `G[:, valid_pos_local, :].float().mean(dim=1)` allocated a 5.42 GiB BF16 fancy-index
+    copy AND a 10.84 GiB FP32 cast on GPU simultaneously. Using a zero-copy slice + chunked
+    `mean(dim=1, dtype=torch.float32)` keeps peak temporary GPU VRAM at ~10 MB (0.01 GiB)!
+    """
+    K_cur, _, D_hc = G.shape
+    out = torch.empty((K_cur, D_hc), dtype=torch.float32)
+    n_valid = int(valid_pos_local.numel())
+    lo = int(valid_pos_local[0].item())
+    hi = int(valid_pos_local[-1].item()) + 1
+    is_contig = (hi - lo) == n_valid
+    for k0 in range(0, K_cur, k_chunk):
+        k1 = min(k0 + k_chunk, K_cur)
+        sub = G[k0:k1, lo:hi, :] if is_contig else G[k0:k1, valid_pos_local, :]
+        out[k0:k1] = sub.mean(dim=1, dtype=torch.float32).cpu()
+    return out
+
+
 class Qwen38JLensEngine:
     """High-performance single-sweep Jacobian Lens fitter and inference applier for Qwen3.8-Flash-Next."""
 
@@ -557,75 +582,79 @@ class Qwen38JLensEngine:
 
             # Build initial one-hot cotangent at target h_final for valid positions on [bwd_start:],
             # then immediately backprop through hyper_connection_mixer -> G_{L-1} [K_cur, T_v, D_hc]!
-            G = torch.zeros((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
-            d_target_chunk = torch.zeros(
-                (min(self.plan.moe_k_chunk, K_cur), T_v, D), device=self.device, dtype=self.dtype
-            )
-            k_sub_idx = torch.arange(d_target_chunk.shape[0], device=self.device)
-            for c0 in range(0, K_cur, d_target_chunk.shape[0]):
-                c1 = min(c0 + d_target_chunk.shape[0], K_cur)
-                nc = c1 - c0
-                d_target_chunk[:nc].zero_()
-                d_target_chunk[
-                    k_sub_idx[:nc, None],
-                    valid_pos_local[None, :],
-                    (k_start + c0) + k_sub_idx[:nc, None],
-                ] = 1.0
-                G[c0:c1] = gated_residual_vjp(
-                    d_target_chunk[:nc], None, self.model.hyper_connection_mixer, mixer_saved_v
+            G: torch.Tensor | None = torch.zeros((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
+            try:
+                d_target_chunk = torch.zeros(
+                    (min(self.plan.moe_k_chunk, K_cur), T_v, D), device=self.device, dtype=self.dtype
                 )
-            del d_target_chunk
+                k_sub_idx = torch.arange(d_target_chunk.shape[0], device=self.device)
+                for c0 in range(0, K_cur, d_target_chunk.shape[0]):
+                    c1 = min(c0 + d_target_chunk.shape[0], K_cur)
+                    nc = c1 - c0
+                    d_target_chunk[:nc].zero_()
+                    d_target_chunk[
+                        k_sub_idx[:nc, None],
+                        valid_pos_local[None, :],
+                        (k_start + c0) + k_sub_idx[:nc, None],
+                    ] = 1.0
+                    G[c0:c1] = gated_residual_vjp(
+                        d_target_chunk[:nc], None, self.model.hyper_connection_mixer, mixer_saved_v
+                    )
+                del d_target_chunk
 
-            # Layer L-1 output H_{L-1} Jacobian!
-            if (n_layers - 1) in src_set:
-                rows = G[:, valid_pos_local, :].float().mean(dim=1).cpu()
-                jacobians[n_layers - 1][k_start:k_end, :] = rows
+                # Layer L-1 output H_{L-1} Jacobian (chunked fp32 reduction -> 0.01 GiB peak vs 16.26 GiB!)
+                if (n_layers - 1) in src_set:
+                    jacobians[n_layers - 1][k_start:k_end, :] = _reduce_valid_mean_cpu(
+                        G, valid_pos_local, k_chunk=self.plan.moe_k_chunk
+                    )
 
-            # Reverse layer sweep: L-1 -> min_src + 1
-            for l_idx, experts in self.streamer.iter_sweep(bwd_layers):
-                H_in_l = cached.layer_inputs[l_idx]
-                if H_in_l.device != self.device:
-                    H_in_l = H_in_l.to(self.device, non_blocking=non_blocking)
+                # Reverse layer sweep: L-1 -> min_src + 1
+                for l_idx, experts in self.streamer.iter_sweep(bwd_layers):
+                    H_in_l = cached.layer_inputs[l_idx]
+                    if H_in_l.device != self.device:
+                        H_in_l = H_in_l.to(self.device, non_blocking=non_blocking)
 
-                # Recompute ONE tiny B=1 forward of layer l_idx (~0.5 ms), keeping suffix-hit active
-                # experts dequantized in BF16 when E_hit <= expert_dequant_chunk!
-                _, saved_l = decoder_layer_fwd(
-                    H_in_l,
-                    self.model.layers[l_idx],
-                    experts,
-                    cos,
-                    sin,
-                    self.gdn_backend,
-                    ple_embeddings=ple_embs.get(l_idx),
-                    dequant_chunk_size=self.plan.expert_dequant_chunk,
-                    use_triton_dequant=self.plan.use_triton_fp8_dequant,
-                    keep_experts_dequantized=True,
-                    bwd_start=bwd_start,
-                )
-                del H_in_l
+                    # Recompute ONE tiny B=1 forward of layer l_idx (~0.5 ms), keeping suffix-hit active
+                    # experts dequantized in BF16 when E_hit <= expert_dequant_chunk!
+                    _, saved_l = decoder_layer_fwd(
+                        H_in_l,
+                        self.model.layers[l_idx],
+                        experts,
+                        cos,
+                        sin,
+                        self.gdn_backend,
+                        ple_embeddings=ple_embs.get(l_idx),
+                        dequant_chunk_size=self.plan.expert_dequant_chunk,
+                        use_triton_dequant=self.plan.use_triton_fp8_dequant,
+                        keep_experts_dequantized=True,
+                        bwd_start=bwd_start,
+                    )
+                    del H_in_l
 
-                # In-place VJP across ALL K_cur cotangents on [bwd_start:]!
-                decoder_layer_vjp_inplace(
-                    G,
-                    self.model.layers[l_idx],
-                    experts,
-                    saved_l,
-                    self.gdn_backend,
-                    attn_k_chunk=self.plan.attn_k_chunk,
-                    moe_k_chunk=self.plan.moe_k_chunk,
-                    dequant_chunk_size=self.plan.expert_dequant_chunk,
-                    use_triton_dequant=self.plan.use_triton_fp8_dequant,
-                    use_triton_swiglu=self.plan.use_triton_swiglu_vjp,
-                )
-                del saved_l
+                    # In-place VJP across ALL K_cur cotangents on [bwd_start:]!
+                    decoder_layer_vjp_inplace(
+                        G,
+                        self.model.layers[l_idx],
+                        experts,
+                        saved_l,
+                        self.gdn_backend,
+                        attn_k_chunk=self.plan.attn_k_chunk,
+                        moe_k_chunk=self.plan.moe_k_chunk,
+                        dequant_chunk_size=self.plan.expert_dequant_chunk,
+                        use_triton_dequant=self.plan.use_triton_fp8_dequant,
+                        use_triton_swiglu=self.plan.use_triton_swiglu_vjp,
+                    )
+                    del saved_l
 
-                # After layer l_idx backward, G is now d h_final / d H_{l_idx - 1} on [bwd_start:]!
-                prev_layer = l_idx - 1
-                if prev_layer in src_set:
-                    rows = G[:, valid_pos_local, :].float().mean(dim=1).cpu()
-                    jacobians[prev_layer][k_start:k_end, :] = rows
-
-            del G
+                    # After layer l_idx backward, G is now d h_final / d H_{l_idx - 1} on [bwd_start:]!
+                    prev_layer = l_idx - 1
+                    if prev_layer in src_set:
+                        jacobians[prev_layer][k_start:k_end, :] = _reduce_valid_mean_cpu(
+                            G, valid_pos_local, k_chunk=self.plan.moe_k_chunk
+                        )
+            finally:
+                # Explicitly drop 5.47 GiB cotangent buffer so Jupyter tracebacks never trap it on crash/interrupt!
+                G = None
 
         if self.device.type == "cuda":
             torch.cuda.synchronize()
