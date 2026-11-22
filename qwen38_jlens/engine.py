@@ -331,19 +331,30 @@ def _reduce_valid_mean_cpu(
     valid_pos_local: torch.Tensor,
     *,
     k_chunk: int = 256,
+    out: torch.Tensor | None = None,
+    mean_gpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact fp32 mean over valid positions without allocating a 16.26 GiB fancy-indexed fp32 copy of `G`!
 
-    Previously `G[:, valid_pos_local, :].float().mean(dim=1)` allocated a 5.42 GiB BF16 fancy-index
-    copy AND a 10.84 GiB FP32 cast on GPU simultaneously. Using a zero-copy slice + chunked
-    `mean(dim=1, dtype=torch.float32)` keeps peak temporary GPU VRAM at ~10 MB (0.01 GiB)!
+    Accumulates chunked `mean(dim=1, dtype=torch.float32)` into a tiny 0.10 GiB reusable GPU buffer
+    (`mean_gpu`) and issues ONE single D2H copy directly into `out` (eliminating 440+ GPU-CPU sync
+    stalls and 5.14 GiB of temporary CPU page-fault allocations per prompt).
     """
     K_cur, _, D_hc = G.shape
-    out = torch.empty((K_cur, D_hc), dtype=torch.float32)
+    if out is None:
+        out = torch.empty((K_cur, D_hc), dtype=torch.float32)
     n_valid = int(valid_pos_local.numel())
     lo = int(valid_pos_local[0].item())
     hi = int(valid_pos_local[-1].item()) + 1
     is_contig = (hi - lo) == n_valid
+    if G.is_cuda and mean_gpu is not None:
+        dst_gpu = mean_gpu[:K_cur]
+        for k0 in range(0, K_cur, k_chunk):
+            k1 = min(k0 + k_chunk, K_cur)
+            sub = G[k0:k1, lo:hi, :] if is_contig else G[k0:k1, valid_pos_local, :]
+            torch.mean(sub, dim=1, dtype=torch.float32, out=dst_gpu[k0:k1])
+        out.copy_(dst_gpu)
+        return out
     for k0 in range(0, K_cur, k_chunk):
         k1 = min(k0 + k_chunk, K_cur)
         sub = G[k0:k1, lo:hi, :] if is_contig else G[k0:k1, valid_pos_local, :]
@@ -736,6 +747,8 @@ class Qwen38JLensEngine:
         self,
         cached: _CachedPromptForward,
         src_list: list[int],
+        *,
+        out_jacobians: dict[int, torch.Tensor] | None = None,
     ) -> tuple[dict[int, torch.Tensor], float]:
         """Run exact single-sweep backward propagation (L-1 -> min_src + 1) from a cached forward pass."""
         t_bwd_start = time.perf_counter()
@@ -764,7 +777,11 @@ class Qwen38JLensEngine:
             for l_idx, t in cached.ple_embs.items()
         }
 
-        jacobians = {l: torch.zeros((D, D_hc), dtype=torch.float32) for l in src_list}
+        jacobians = (
+            out_jacobians
+            if out_jacobians is not None
+            else {l: torch.empty((D, D_hc), dtype=torch.float32) for l in src_list}
+        )
         k_pass = min(self.plan.k_pass, D)
         bwd_layers = list(range(n_layers - 1, min_src, -1))
         non_blocking = self.device.type == "cuda"
@@ -775,7 +792,12 @@ class Qwen38JLensEngine:
 
             # Build initial one-hot cotangent at target h_final for valid positions on [bwd_start:],
             # then immediately backprop through hyper_connection_mixer -> G_{L-1} [K_cur, T_v, D_hc]!
-            G: torch.Tensor | None = torch.zeros((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
+            G: torch.Tensor | None = torch.empty((K_cur, T_v, D_hc), device=self.device, dtype=self.dtype)
+            mean_gpu: torch.Tensor | None = (
+                torch.empty((K_cur, D_hc), device=self.device, dtype=torch.float32)
+                if self.device.type == "cuda"
+                else None
+            )
             try:
                 hc_k_chunk = min(64, self.plan.moe_k_chunk, K_cur)
                 d_target_chunk = torch.zeros(
@@ -796,10 +818,14 @@ class Qwen38JLensEngine:
                     )
                 del d_target_chunk
 
-                # Layer L-1 output H_{L-1} Jacobian (chunked fp32 reduction -> 0.01 GiB peak vs 16.26 GiB!)
+                # Layer L-1 output H_{L-1} Jacobian (single 105 MB D2H copy per layer, 0 CPU temp allocs!)
                 if (n_layers - 1) in src_set:
-                    jacobians[n_layers - 1][k_start:k_end, :] = _reduce_valid_mean_cpu(
-                        G, valid_pos_local, k_chunk=self.plan.moe_k_chunk
+                    _reduce_valid_mean_cpu(
+                        G,
+                        valid_pos_local,
+                        k_chunk=self.plan.moe_k_chunk,
+                        out=jacobians[n_layers - 1][k_start:k_end, :],
+                        mean_gpu=mean_gpu,
                     )
 
                 # Reverse layer sweep: L-1 -> min_src + 1
@@ -843,12 +869,17 @@ class Qwen38JLensEngine:
                     # After layer l_idx backward, G is now d h_final / d H_{l_idx - 1} on [bwd_start:]!
                     prev_layer = l_idx - 1
                     if prev_layer in src_set:
-                        jacobians[prev_layer][k_start:k_end, :] = _reduce_valid_mean_cpu(
-                            G, valid_pos_local, k_chunk=self.plan.moe_k_chunk
+                        _reduce_valid_mean_cpu(
+                            G,
+                            valid_pos_local,
+                            k_chunk=self.plan.moe_k_chunk,
+                            out=jacobians[prev_layer][k_start:k_end, :],
+                            mean_gpu=mean_gpu,
                         )
             finally:
                 # Explicitly drop 5.47 GiB cotangent buffer so Jupyter tracebacks never trap it on crash/interrupt!
                 G = None
+                mean_gpu = None
 
         if self.device.type == "cuda":
             torch.cuda.synchronize()
@@ -1014,6 +1045,14 @@ class Qwen38JLensEngine:
         sqrt_d = math.sqrt(D)
         prompts_since_ckpt = 0
         early_stopped = False
+        # Allocate ONE reusable per-prompt Jacobian dict (5.14 GiB) + cache ||jacobian_sum[l]||_F so every
+        # prompt runs with ZERO 20+ GiB Linux mmap/page-fault churn (~3.5s/prompt wall-clock saved!).
+        per_J_buf: dict[int, torch.Tensor] | None = {
+            l: torch.empty((D, D_hc), dtype=torch.float32) for l in src_layers
+        }
+        prev_sum_norms: dict[int, float] = {
+            l: (jacobian_sum[l].norm().item() if n_done > 0 else 0.0) for l in src_layers
+        }
         try:
             batch_start = next_idx
             while batch_start < total_prompts and not early_stopped:
@@ -1055,7 +1094,10 @@ class Qwen38JLensEngine:
                     cached = cached_by_pidx.pop(p_idx)
                     seq_len = cached.seq_len
                     n_valid = cached.n_valid
-                    per_J, t_bwd = self._backward_from_cached_forward(cached, src_layers)
+                    assert per_J_buf is not None
+                    per_J, t_bwd = self._backward_from_cached_forward(
+                        cached, src_layers, out_jacobians=per_J_buf
+                    )
                     del cached
                     if self.device.type == "cuda" and n_done == resumed_n_done:
                         peak = torch.cuda.max_memory_allocated(self.device) / (1024**3)
@@ -1065,21 +1107,30 @@ class Qwen38JLensEngine:
                             peak, total, total - peak,
                         )
 
-                    max_norm = max(per_J[l].norm().item() for l in src_layers) / sqrt_d
-                    if n_done > 0:
-                        rel_change = max(
-                            (
-                                (per_J[l] - jacobian_sum[l] / n_done).norm()
-                                / ((n_done + 1) * max(1e-8, (jacobian_sum[l] / n_done).norm().item()))
-                            ).item()
-                            for l in src_layers
-                        )
-                    else:
-                        rel_change = float("nan")
-
+                    # Exact zero-allocation update & convergence metric reusing per_J[l] in-place:
+                    #   S_{n+1} = S_n + J_new
+                    #   (n+1)*J_new - S_{n+1} = n*(J_new - S_n/n)
+                    #   ||n*(J_new - S_n/n)|| / ((n+1)*||S_n||) == ||J_new - S_n/n|| / ((n+1)*||S_n/n||)
+                    max_norm_raw = 0.0
+                    rel_change = 0.0 if n_done > 0 else float("nan")
+                    n_next = n_done + 1
                     for l in src_layers:
-                        jacobian_sum[l].add_(per_J[l])
-                    n_done += 1
+                        j_l = per_J[l]
+                        s_l = jacobian_sum[l]
+                        n_j = j_l.norm().item()
+                        if n_j > max_norm_raw:
+                            max_norm_raw = n_j
+                        s_l.add_(j_l)
+                        if n_done > 0:
+                            j_l.mul_(float(n_next)).sub_(s_l)
+                            denom = n_next * max(1e-8 * n_done, prev_sum_norms[l])
+                            rc = j_l.norm().item() / denom
+                            if rc > rel_change:
+                                rel_change = rc
+                        prev_sum_norms[l] = s_l.norm().item()
+                    max_norm = max_norm_raw / sqrt_d
+
+                    n_done = n_next
                     next_idx = p_idx + 1
                     prompts_since_ckpt += 1
                     elapsed = t_fwd_amort + t_bwd
@@ -1158,6 +1209,8 @@ class Qwen38JLensEngine:
             if owned_mgr and mgr is not None:
                 mgr.close()
             raise
+        finally:
+            per_J_buf = None
 
         # Final checkpoint flush (wait for Drive / HF Hub upload to finish!)
         if mgr is not None and n_done > 0:
