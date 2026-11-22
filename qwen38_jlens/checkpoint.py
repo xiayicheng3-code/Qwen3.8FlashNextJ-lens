@@ -104,6 +104,77 @@ def peek_checkpoint_metadata(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _fsync_path(path: str) -> None:
+    """Best-effort fsync of a regular file path (tolerates filesystems that disallow O_RDONLY fsync)."""
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _fsync_dir(dir_path: str) -> None:
+    """Best-effort fsync of a directory entry after atomic rename (tolerates FUSE mounts)."""
+    if not dir_path or not hasattr(os, "O_DIRECTORY"):
+        return
+    fd: int | None = None
+    try:
+        fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _copy_file_durable(src_path: str, dst_path: str, *, buf_size: int = 8 * 1024 * 1024) -> None:
+    """Copy a file in large chunks and explicitly flush + fsync before closing."""
+    with open(src_path, "rb") as src_f, open(dst_path, "wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f, length=buf_size)
+        dst_f.flush()
+        try:
+            os.fsync(dst_f.fileno())
+        except OSError:
+            pass
+
+
+def find_best_lens_path(candidate_paths: Sequence[str | None]) -> tuple[str, dict[str, Any]] | None:
+    """Inspect candidate `.safetensors` / `.pt` paths and return `(path, meta)` with highest `(next_idx, is_fp32)`."""
+    best: tuple[tuple[int, int, int], str, dict[str, Any]] | None = None
+    seen: set[str] = set()
+    for idx, path in enumerate(candidate_paths):
+        if not path:
+            continue
+        abs_p = os.path.abspath(path)
+        if abs_p in seen or not os.path.isfile(path):
+            continue
+        seen.add(abs_p)
+        meta = peek_checkpoint_metadata(path)
+        if meta is None:
+            continue
+        is_fp32 = 1 if str(meta.get("ckpt_dtype", "")).lower() in ("float32", "fp32") else 0
+        rank = (int(meta["next_idx"]), is_fp32, -idx)
+        if best is None or rank > best[0]:
+            best = (rank, path, meta)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def _layer_tensor_key(prefix: str, layer: int) -> str:
     return f"{prefix}.embed" if int(layer) == -1 else f"{prefix}.layer_{int(layer):02d}"
 
@@ -163,7 +234,9 @@ def save_jlens_safetensors(
 
     tmp_path = f"{path}.tmp.{os.getpid()}"
     save_file(tensors, tmp_path, metadata=metadata)
+    _fsync_path(tmp_path)
     os.replace(tmp_path, path)
+    _fsync_dir(parent)
     return path
 
 
@@ -311,6 +384,8 @@ class CheckpointConfig:
     drive_path: str | None = None                 # Recommended remote mirror: Google Drive (async background copy)
     local_convergence_csv: str | None = None      # Optional local per-prompt convergence CSV
     drive_convergence_csv: str | None = None      # Optional Drive mirror of convergence CSV
+    bundle_safetensors_path: str | None = None    # Optional exported 4-branch release bundle fallback for resume
+    bundle_convergence_csv: str | None = None     # Optional exported release bundle convergence CSV fallback
     hf_repo_id: str | None = None                 # Optional (discouraged alongside Drive due to shared NIC & Git history bloat)
     hf_path_in_repo: str | None = None
     hf_token: str | None = None
@@ -331,7 +406,7 @@ class AsyncCheckpointManager:
         local NVMe is still updated and the next completed window triggers the remote sync;
         `flush()` waits cleanly on completion or `KeyboardInterrupt`).
       - Multi-source resume automatically chooses the freshest checkpoint across Local NVMe,
-        Google Drive (and HF Hub if configured), and restores `convergence.csv` transparently!
+        Google Drive, exported release bundle (and HF Hub if configured), and restores `convergence.csv` transparently!
     """
 
     def __init__(self, cfg: CheckpointConfig) -> None:
@@ -364,16 +439,24 @@ class AsyncCheckpointManager:
             return True
         return False
 
-    def _copy_to_drive(self, src_path: str, dst_path: str) -> None:
-        """Atomic copy to Google Drive FUSE with retry for transient FUSE errors."""
+    def _copy_to_drive(self, src_path: str, dst_path: str, *, expected_next_idx: int | None = None) -> None:
+        """Durable atomic copy to Google Drive FUSE with fsync, header readback verification, and retries."""
         parent = os.path.dirname(os.path.abspath(dst_path))
         os.makedirs(parent, exist_ok=True)
         tmp_dst = f"{dst_path}.uploading"
         last_exc: Exception | None = None
         for attempt in range(1, self.cfg.max_sync_retries + 1):
             try:
-                shutil.copyfile(src_path, tmp_dst)
+                _copy_file_durable(src_path, tmp_dst)
                 os.replace(tmp_dst, dst_path)
+                _fsync_dir(parent)
+                if expected_next_idx is not None and dst_path.endswith(".safetensors"):
+                    meta = peek_checkpoint_metadata(dst_path)
+                    if meta is None or int(meta["next_idx"]) != int(expected_next_idx):
+                        got = None if meta is None else meta.get("next_idx")
+                        raise RuntimeError(
+                            f"Drive readback verification mismatch on {dst_path}: expected next_idx={expected_next_idx}, got {got}"
+                        )
                 return
             except Exception as exc:
                 last_exc = exc
@@ -421,7 +504,7 @@ class AsyncCheckpointManager:
         targets: list[str] = []
         try:
             if self.cfg.drive_path:
-                self._copy_to_drive(staged_path, self.cfg.drive_path)
+                self._copy_to_drive(staged_path, self.cfg.drive_path, expected_next_idx=next_idx)
                 if (
                     self.cfg.drive_convergence_csv
                     and self.cfg.local_convergence_csv
@@ -509,14 +592,20 @@ class AsyncCheckpointManager:
         expected_source_layers: Sequence[int],
         expected_skip_first: int,
     ) -> tuple[dict[int, torch.Tensor], int, int] | None:
-        """Inspect Local NVMe, Google Drive (and optional HF Hub); resume from highest `next_idx`."""
-        candidates: list[tuple[int, str, str]] = []
+        """Inspect Local NVMe, Google Drive, release bundle (and optional HF Hub); resume from highest `next_idx`."""
+        # Tuple: (next_idx, tie_break_priority, label, path)
+        # Prefer fp32 mutable checkpoints over fp16 release bundle when `next_idx` is equal.
+        candidates: list[tuple[int, int, str, str]] = []
 
-        for label, path in (("local", self.cfg.local_path), ("drive", self.cfg.drive_path)):
+        for priority, label, path in (
+            (3, "local", self.cfg.local_path),
+            (2, "drive", self.cfg.drive_path),
+            (0, "bundle", self.cfg.bundle_safetensors_path),
+        ):
             if path and os.path.isfile(path):
                 meta = peek_checkpoint_metadata(path)
                 if meta is not None:
-                    candidates.append((meta["next_idx"], label, path))
+                    candidates.append((int(meta["next_idx"]), priority, label, path))
 
         if self.cfg.hf_repo_id:
             try:
@@ -531,30 +620,33 @@ class AsyncCheckpointManager:
                 )
                 meta = peek_checkpoint_metadata(dl_path)
                 if meta is not None:
-                    candidates.append((meta["next_idx"], f"hf:{self.cfg.hf_repo_id}", dl_path))
+                    candidates.append((int(meta["next_idx"]), 1, f"hf:{self.cfg.hf_repo_id}", dl_path))
             except Exception as exc:
                 logger.info("No resumable checkpoint found on HF Hub %s (%s).", self.cfg.hf_repo_id, exc)
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        best_next, best_label, best_path = candidates[0]
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best_next, _, best_label, best_path = candidates[0]
         logger.info("Selected freshest checkpoint from %s (%s, next_idx=%d).", best_label, best_path, best_next)
 
-        # Restore Drive convergence CSV to local NVMe when resuming on a fresh VM
-        if (
-            self.cfg.drive_convergence_csv
-            and self.cfg.local_convergence_csv
-            and os.path.isfile(self.cfg.drive_convergence_csv)
-        ):
+        # Restore freshest convergence CSV (Drive or release bundle) to local NVMe when resuming on a fresh VM
+        if self.cfg.local_convergence_csv:
             local_sz = os.path.getsize(self.cfg.local_convergence_csv) if os.path.isfile(self.cfg.local_convergence_csv) else -1
-            drive_sz = os.path.getsize(self.cfg.drive_convergence_csv)
-            if drive_sz > local_sz:
+            best_csv: tuple[int, str] | None = None
+            for csv_src in (self.cfg.drive_convergence_csv, self.cfg.bundle_convergence_csv):
+                if csv_src and os.path.isfile(csv_src):
+                    if os.path.abspath(csv_src) == os.path.abspath(self.cfg.local_convergence_csv):
+                        continue
+                    sz = os.path.getsize(csv_src)
+                    if sz > local_sz and (best_csv is None or sz > best_csv[0]):
+                        best_csv = (sz, csv_src)
+            if best_csv is not None:
                 parent = os.path.dirname(os.path.abspath(self.cfg.local_convergence_csv))
                 if parent:
                     os.makedirs(parent, exist_ok=True)
-                shutil.copyfile(self.cfg.drive_convergence_csv, self.cfg.local_convergence_csv)
+                shutil.copyfile(best_csv[1], self.cfg.local_convergence_csv)
 
         if best_path.endswith(".safetensors"):
             j_mean, meta = load_jlens_safetensors(best_path)
@@ -647,7 +739,10 @@ def export_neuronpedia_bundle(
     final_rel: float | None = None
     final_norm: float | None = None
     if convergence_csv_path and os.path.isfile(convergence_csv_path):
-        shutil.copyfile(convergence_csv_path, csv_dst)
+        if os.path.abspath(convergence_csv_path) != os.path.abspath(csv_dst):
+            tmp_csv = f"{csv_dst}.tmp.{os.getpid()}"
+            _copy_file_durable(convergence_csv_path, tmp_csv)
+            os.replace(tmp_csv, csv_dst)
         written["convergence_csv"] = csv_dst
         final_rel, final_norm = ConvergenceLogger(csv_dst, resume_next_idx=10**9).last_summary()
 
@@ -684,6 +779,7 @@ def export_neuronpedia_bundle(
     }
     tmp_pt = f"{pt_path}.tmp.{os.getpid()}"
     torch.save(pt_payload, tmp_pt)
+    _fsync_path(tmp_pt)
     os.replace(tmp_pt, pt_path)
     written["neuronpedia_pt"] = pt_path
 
@@ -701,6 +797,9 @@ def export_neuronpedia_bundle(
             dtype=torch.float16,
             include_collapsed=True,
         )
+        meta_check = peek_checkpoint_metadata(st_path)
+        if meta_check is None or int(meta_check["n_done"]) != int(lens.n_prompts):
+            raise RuntimeError(f"Exported release bundle verification failed for {st_path}: {meta_check}")
         written["full_4branch_safetensors"] = st_path
 
     # 4. Neuronpedia-compatible `config.yaml`
@@ -756,6 +855,11 @@ def export_neuronpedia_bundle(
     ]
     with open(cfg_path, "w", encoding="utf-8") as f:
         f.write("\n".join(yaml_lines))
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     written["config_yaml"] = cfg_path
 
     # 5. Contributor `CREDIT.md`
@@ -784,6 +888,12 @@ def export_neuronpedia_bundle(
 """
     with open(credit_path, "w", encoding="utf-8") as f:
         f.write(credit_md)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    _fsync_dir(bundle_dir)
     written["credit_md"] = credit_path
     return written
 

@@ -206,6 +206,9 @@ DRIVE_CONV_CSV = os.path.join(DRIVE_OUT_DIR, CONV_FILENAME) if DRIVE_ENABLED els
 OUT_DIR = DRIVE_OUT_DIR if DRIVE_ENABLED else LOCAL_CKPT_DIR
 BUNDLE_REL_DIR = "qwen3.8-flash-next/jlens/Salesforce-wikitext"
 BUNDLE_DIR = os.path.join(OUT_DIR, f"release_{TAG}", BUNDLE_REL_DIR)
+BUNDLE_PT_PATH = os.path.join(BUNDLE_DIR, "Qwen3.8-Flash-Next-FP8_jacobian_lens.pt")
+BUNDLE_4BRANCH_PATH = os.path.join(BUNDLE_DIR, "Qwen3.8-Flash-Next-FP8_jacobian_lens_4branch.safetensors")
+BUNDLE_CONV_CSV = os.path.join(BUNDLE_DIR, "Qwen3.8-Flash-Next-FP8_convergence.csv")
 
 print("Persistence & Publishing Plan:")
 print(f"  Mid-run Local NVMe    : {LOCAL_CKPT_PATH} (<1s atomic write)")
@@ -528,6 +531,8 @@ ckpt_mgr = AsyncCheckpointManager(
         drive_path=DRIVE_CKPT_PATH,
         local_convergence_csv=LOCAL_CONV_CSV,
         drive_convergence_csv=DRIVE_CONV_CSV,
+        bundle_safetensors_path=BUNDLE_4BRANCH_PATH,
+        bundle_convergence_csv=BUNDLE_CONV_CSV,
         hf_repo_id=None,  # Keep HF Hub clean during fitting; publish in ONE commit in Cell 9!
         ckpt_dtype=CKPT_DTYPE,
         every_n_prompts=CHECKPOINT_EVERY_PROMPTS,
@@ -536,7 +541,11 @@ ckpt_mgr = AsyncCheckpointManager(
     )
 )
 
-for lbl, p in (("Local NVMe", LOCAL_CKPT_PATH), ("Google Drive", DRIVE_CKPT_PATH)):
+for lbl, p in (
+    ("Local NVMe", LOCAL_CKPT_PATH),
+    ("Google Drive", DRIVE_CKPT_PATH),
+    ("Release Bundle", BUNDLE_4BRANCH_PATH),
+):
     meta = peek_checkpoint_metadata(p) if p else None
     if meta:
         print(f"Found existing {lbl} checkpoint: next_idx={meta['next_idx']}, n_done={meta['n_done']} ({meta['ckpt_dtype']})")
@@ -611,6 +620,12 @@ for k, p in bundle_files.items():
 print(f"  Summary   : {lens}")
 print(f"  Total time: {total_min:.2f} min ({(total_min*60)/max(1, len(times)):.2f} s/prompt)")
 print(f"  Peak VRAM : {peak_vram:.2f} GiB")
+if DRIVE_ENABLED:
+    print(
+        "\\nIMPORTANT (Google Drive FUSE): Colab uploads multi-GB files asynchronously in the background after writes return.\\n"
+        "  - Run Section 8 (Verify) and Section 9 (Publish to HF Hub) now in this same session (HF Hub upload is synchronous HTTPS!).\\n"
+        "  - Before closing Colab, run `from google.colab import drive; drive.flush_and_unmount()` so Drive finishes uploading!"
+    )
 """
         )
     )
@@ -621,14 +636,23 @@ print(f"  Peak VRAM : {peak_vram:.2f} GiB")
     cells.append(
         new_markdown_cell(
             """## 8. Verify Fitted J-Lens: Multi-Hop Readout, 4-Branch Gated Residual Norms & Interactive Slice
-Compares **J-Lens** (`lm_head(H_l @ J_l.T)`) vs **Logit-Lens** (`lm_head(hyper_connection_mixer(H_l))`) on two-hop reasoning prompts and inspects how signal distributes across Qwen3.8-Flash-Next's 4 Gated Residual branches."""
+Compares **J-Lens** (`lm_head(H_l @ J_l.T)`) vs **Logit-Lens** (`lm_head(hyper_connection_mixer(H_l))`) on two-hop reasoning prompts and inspects how signal distributes across Qwen3.8-Flash-Next's 4 Gated Residual branches.
+- Works both right after Section 7 **and standalone** on a fresh session (auto-loads the freshest checkpoint / release bundle from Google Drive or local NVMe if `lens` is not in memory)."""
         )
     )
     cells.append(
         new_code_cell(
             """import torch
 from IPython.display import HTML, display
-from qwen38_jlens import render_slice_html
+from qwen38_jlens import Qwen38JacobianLens, find_best_lens_path, render_slice_html
+
+# Auto-load fitted J-lens from Drive / release bundle / local NVMe if running standalone after a restart
+if "lens" not in globals() or lens is None:
+    best = find_best_lens_path([DRIVE_CKPT_PATH, BUNDLE_4BRANCH_PATH, LOCAL_CKPT_PATH])
+    assert best is not None, "No fitted J-lens found in memory, Google Drive, or local NVMe. Run Section 7 first."
+    best_path, best_meta = best
+    print(f"Auto-loaded J-lens from {best_path} (n_done={best_meta['n_done']}, {best_meta['ckpt_dtype']})")
+    lens = Qwen38JacobianLens.load(best_path)
 
 # 1. Inspect 4-branch Gated Residual Frobenius norms across depth (including Emb -1 if enabled)
 bnorms = lens.branch_norms()
@@ -685,22 +709,36 @@ display(HTML(render_slice_html(tok_strs, layer_top1, model_top1, title=f"Qwen3.8
         new_markdown_cell(
             """## 9. One-Shot Publish to Hugging Face Hub (Neuronpedia-Ready) & Optional Shard Merge
 - Uploads the **entire release folder in ONE single clean commit** (`_jacobian_lens.pt` fp16 + `_4branch.safetensors` + `_convergence.csv` + `config.yaml` + `CREDIT.md`) — zero rate-limit risk and clean Git history for contributing to [`neuronpedia/jacobian-lens`](https://huggingface.co/neuronpedia/jacobian-lens).
+- Works **standalone** in a fresh session (Cells 2, 3, and 9 only — no need to reload the 172 GiB model or re-run fitting if `BUNDLE_DIR` is already on Google Drive!).
 - If you ran parallel Colab shards (`PROMPT_OFFSET = 0, 200, 400, ...`), uncomment the merge block first to combine all Drive checkpoints into one exact `n_prompts`-weighted bundle before publishing."""
         )
     )
     cells.append(
         new_code_cell(
             """import glob, os
-from qwen38_jlens import Qwen38JacobianLens, export_neuronpedia_bundle, publish_bundle_to_hf
+from qwen38_jlens import (
+    Qwen38JacobianLens,
+    export_neuronpedia_bundle,
+    peek_checkpoint_metadata,
+    publish_bundle_to_hf,
+)
 
 PUBLISH_DIR = BUNDLE_DIR
-PUBLISH_LENS = lens
+if "lens" in globals() and lens is not None:
+    PUBLISH_N = int(lens.n_prompts)
+else:
+    _bmeta = peek_checkpoint_metadata(BUNDLE_4BRANCH_PATH)
+    assert _bmeta is not None and os.path.isfile(BUNDLE_PT_PATH), (
+        f"Release bundle not found at {BUNDLE_DIR}. Run Section 7 first or check DRIVE_OUT_DIR."
+    )
+    PUBLISH_N = int(_bmeta["n_done"])
+    print(f"Found existing release bundle on disk: {PUBLISH_DIR} (n_prompts={PUBLISH_N})")
 
 # ---- (Optional) Merge multiple parallel Drive shards before publishing ----
 # shard_ckpts = sorted(glob.glob(f"{OUT_DIR}/qwen38_jlens_ckpt_off*.safetensors"))
 # print("Merging shards:", shard_ckpts)
 # merged_lens = Qwen38JacobianLens.merge([Qwen38JacobianLens.load(p) for p in shard_ckpts])
-# PUBLISH_LENS = merged_lens
+# PUBLISH_N = int(merged_lens.n_prompts)
 # PUBLISH_DIR = os.path.join(OUT_DIR, f"release_merged_n{merged_lens.n_prompts}", BUNDLE_REL_DIR)
 # export_neuronpedia_bundle(
 #     merged_lens,
@@ -725,15 +763,19 @@ if HF_PUBLISH_REPO:
         path_in_repo=BUNDLE_REL_DIR,
         token=HF_TOKEN,
         private=HF_PUBLISH_PRIVATE,
-        commit_message=f"Publish Qwen3.8-Flash-Next Jacobian Lens (n={PUBLISH_LENS.n_prompts}, Neuronpedia format)",
+        commit_message=f"Publish Qwen3.8-Flash-Next Jacobian Lens (n={PUBLISH_N}, Neuronpedia format)",
     )
     print(f"Published in a single clean HF commit -> {commit_url}")
 else:
     print(f"HF_PUBLISH_REPO is empty. Your Neuronpedia-ready bundle is saved locally/on Drive at:\\n  {PUBLISH_DIR}")
     print("Set HF_PUBLISH_REPO = 'your-username/qwen3.8-flash-next-jlens' in Cell 2 and re-run this cell to publish!")
 
+# Optional: uncomment and run as your VERY LAST step before closing Colab to guarantee Google Drive
+# FUSE finishes uploading all multi-GB checkpoint/bundle files to Google Drive servers:
+# from google.colab import drive; drive.flush_and_unmount()
+
 # Optional cleanup of temporary local NVMe slabs / PLE shards:
-# engine.close()
+# if "engine" in globals(): engine.close()
 """
         )
     )

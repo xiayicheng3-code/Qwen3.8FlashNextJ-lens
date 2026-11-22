@@ -228,3 +228,79 @@ def test_convergence_logger_truncates_crash_tail_on_resume(tmp_path: Path):
     assert len(rows) == 3  # header + prompt 0 + prompt 1
     assert len(lg2.tail_deltas(10)) == 2
 
+
+def test_bundle_fallback_resume_tiebreak_and_find_best_lens_path(tmp_path: Path):
+    from qwen38_jlens import find_best_lens_path
+
+    local_p = str(tmp_path / "local" / "ckpt.safetensors")
+    drive_p = str(tmp_path / "drive" / "ckpt.safetensors")
+    bundle_p = str(tmp_path / "bundle" / "release_4branch.safetensors")
+    local_csv = str(tmp_path / "local" / "conv.csv")
+    drive_csv = str(tmp_path / "drive" / "conv.csv")
+    bundle_csv = str(tmp_path / "bundle" / "conv.csv")
+
+    # Case 1: Drive checkpoint lagged at 985 while release bundle reached 1000
+    save_jlens_safetensors(
+        drive_p, {0: torch.ones(8, 32)}, n_done=985, next_idx=985, skip_first=2, d_model=8, hc_count=4, dtype=torch.float32
+    )
+    save_jlens_safetensors(
+        bundle_p, {0: torch.full((8, 32), 3.0)}, n_done=1000, next_idx=1000, skip_first=2, d_model=8, hc_count=4, dtype=torch.float16
+    )
+    Path(drive_csv).write_text("prompt_idx,n_done\n0,1\n", encoding="utf-8")
+    Path(bundle_csv).write_text("prompt_idx,n_done\n0,1\n999,1000\n", encoding="utf-8")
+
+    mgr = AsyncCheckpointManager(
+        CheckpointConfig(
+            local_path=local_p,
+            drive_path=drive_p,
+            bundle_safetensors_path=bundle_p,
+            local_convergence_csv=local_csv,
+            drive_convergence_csv=drive_csv,
+            bundle_convergence_csv=bundle_csv,
+        )
+    )
+    resumed = mgr.load_best_resume(expected_source_layers=[0], expected_skip_first=2)
+    assert resumed is not None
+    j_sum, n_done, next_idx = resumed
+    assert n_done == 1000 and next_idx == 1000
+    assert torch.allclose(j_sum[0] / n_done, torch.full((8, 32), 3.0), atol=1e-3)
+    assert "999,1000" in Path(local_csv).read_text(encoding="utf-8")
+    mgr.close()
+
+    best = find_best_lens_path([None, local_p, drive_p, bundle_p])
+    assert best is not None and best[0] == bundle_p and best[1]["next_idx"] == 1000
+
+    # Case 2: Equal next_idx=1000 -> prefer float32 Drive checkpoint over float16 release bundle
+    save_jlens_safetensors(
+        drive_p, {0: torch.full((8, 32), 4.0)}, n_done=1000, next_idx=1000, skip_first=2, d_model=8, hc_count=4, dtype=torch.float32
+    )
+    mgr2 = AsyncCheckpointManager(
+        CheckpointConfig(local_path=local_p, drive_path=drive_p, bundle_safetensors_path=bundle_p)
+    )
+    resumed2 = mgr2.load_best_resume(expected_source_layers=[0], expected_skip_first=2)
+    assert resumed2 is not None
+    j_sum2, n_done2, next_idx2 = resumed2
+    assert n_done2 == 1000 and next_idx2 == 1000
+    assert torch.allclose(j_sum2[0] / n_done2, torch.full((8, 32), 4.0), atol=1e-6)
+    mgr2.close()
+
+    best2 = find_best_lens_path([bundle_p, drive_p])
+    assert best2 is not None and best2[0] == drive_p and best2[1]["ckpt_dtype"] == "float32"
+
+
+def test_drive_copy_readback_verification_detects_mismatch(tmp_path: Path):
+    src_p = str(tmp_path / "src.safetensors")
+    dst_p = str(tmp_path / "drive" / "dst.safetensors")
+    save_jlens_safetensors(
+        src_p, {0: torch.ones(8, 32)}, n_done=10, next_idx=10, skip_first=2, d_model=8, hc_count=4, dtype=torch.float32
+    )
+    mgr = AsyncCheckpointManager(CheckpointConfig(local_path=src_p, drive_path=dst_p, max_sync_retries=1))
+    # Matching expected_next_idx succeeds
+    mgr._copy_to_drive(src_p, dst_p, expected_next_idx=10)
+    assert peek_checkpoint_metadata(dst_p)["next_idx"] == 10
+    # Mismatched expected_next_idx raises RuntimeError so retry/error handling triggers
+    with pytest.raises(RuntimeError, match="readback verification mismatch"):
+        mgr._copy_to_drive(src_p, dst_p, expected_next_idx=15)
+    mgr.close()
+
+
