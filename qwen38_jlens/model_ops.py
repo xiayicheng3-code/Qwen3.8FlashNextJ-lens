@@ -34,6 +34,7 @@ from qwen38_jlens.kernels import (
     hc_inject_vjp_fused,
     moe_gather_scale_fused,
     moe_scatter_add_tk_fused,
+    qsa_softmax_bwd_fused,
     rmsnorm_gated_vjp_fused,
     rmsnorm_vjp_fused,
     swiglu_vjp_pack,
@@ -300,14 +301,18 @@ def gated_residual_vjp(
     del d_u2
     d_u1 = (d_s1.view(K, T, -1) * saved["d_silu_u1"]).mul_(inv_hc)
     del d_s1
-    d_h_norm_2d.addmm_(d_u1.view(K * T, -1), w.input_mix_weight_down)
-    del d_u1
 
-    # Injection gate branch
+    # Combine W_down (320) + block_inject_weight (4) into ONE single addmm_ (halves d_h_norm HBM passes!)
     if d_inj is not None and w.block_inject_weight is not None:
         d_u3 = (d_inj * saved["d_inj_u3"]).mul_(inv_hc)  # [K, T, hc_count]
-        d_h_norm_2d.addmm_(d_u3.reshape(K * T, -1), w.block_inject_weight)
-        del d_u3
+        d_u13 = torch.cat([d_u1.view(K * T, -1), d_u3.reshape(K * T, -1)], dim=-1)
+        del d_u1, d_u3
+        w_down_inj = torch.cat([w.input_mix_weight_down, w.block_inject_weight], dim=0)
+        d_h_norm_2d.addmm_(d_u13, w_down_inj)
+        del d_u13, w_down_inj
+    else:
+        d_h_norm_2d.addmm_(d_u1.view(K * T, -1), w.input_mix_weight_down)
+        del d_u1
 
     return rmsnorm_vjp_fused(
         d_h_norm,
@@ -557,50 +562,45 @@ def qsa_layer_vjp(
     d_gate = d_gated * attn_out_s.unsqueeze(0) * d_sig_gate_s.unsqueeze(0)
     d_attn_flat = d_gated * sig_gate_s.unsqueeze(0)
     del d_gated
-    dO = d_attn_flat.view(K_sub, T_v, H_q, Dh).transpose(1, 2).contiguous()  # [K_sub, H_q, T_v, Dh]
-    del d_attn_flat
 
     # 2. Core causal attention VJP (exact suffix-to-suffix block A_VV + exact dQ[s:] over full keys [0:T_full])
     if saved["attn_mode"] == "l2_cached":
         P = saved["P"]                                                     # [H_q, T_full, T_full] fp32
         P_vv_t = (P[:, s:, s:] if s > 0 else P).to(dtype).contiguous()     # [H_q, T_v, T_v]
-        P_va = P[:, s:, :] if s > 0 else P                                 # [H_q, T_v, T_full] fp32
+        P_va = (P[:, s:, :] if s > 0 else P).contiguous()                  # [H_q, T_v, T_full] fp32
         Q_v = (saved["q_rot"][:, s:, :] if s > 0 else saved["q_rot"]).contiguous()  # [H_q, T_v, Dh]
         K_all = saved["k_rep"]                                             # [H_q, T_full, Dh]
         V_all = saved["v_rep"]                                             # [H_q, T_full, Dh]
 
-        dO_h = dO.transpose(0, 1).contiguous()                             # [H_q, K_sub, T_v, Dh]
-        del dO
+        # Single permute straight to [H_q, T_v, K_sub, Dh] -> ZERO extra dO_for_v or dS_vv transpose copies!
+        dO_htkd = d_attn_flat.view(K_sub, T_v, H_q, Dh).permute(2, 1, 0, 3).contiguous()
+        del d_attn_flat
 
-        # dV[s:] = P[s:, s:]^T @ dO[s:] (causal: P[q, k] = 0 for q < k => prefix q < s never contributes to k >= s)
-        dO_for_v = dO_h.permute(0, 2, 1, 3).reshape(H_q, T_v, K_sub * Dh)
-        dV_rep = torch.bmm(P_vv_t.transpose(1, 2), dO_for_v).view(H_q, T_v, K_sub, Dh).permute(2, 0, 1, 3)
-        del dO_for_v
+        # dV[s:] = P[s:, s:]^T @ dO[s:] -> [H_q, T_v, K_sub, Dh]
+        dV_rep_htkd = torch.bmm(P_vv_t.transpose(1, 2), dO_htkd.view(H_q, T_v, K_sub * Dh)).view(H_q, T_v, K_sub, Dh)
 
-        # dP[s:, 0:T_full] = dO[s:] @ V[0:T_full]^T
-        dP = torch.bmm(dO_h.view(H_q, K_sub * T_v, Dh), V_all.transpose(1, 2)).view(H_q, K_sub, T_v, T_full)
-        del dO_h
+        # dP[s:, 0:T_full] = dO[s:] @ V[0:T_full]^T -> [H_q, T_v, K_sub, T_full]
+        dP_htkt = torch.bmm(dO_htkd.view(H_q, T_v * K_sub, Dh), V_all.transpose(1, 2)).view(H_q, T_v, K_sub, T_full)
+        del dO_htkd
 
-        # Softmax VJP in-place in fp32 over full causal support [0:T_full]: dS = P * (dP - sum(dP * P)) * scaling
-        dP_f = dP.float()
-        del dP
-        P_va_b = P_va.unsqueeze(1)
-        D_dot = (dP_f * P_va_b).sum(dim=-1, keepdim=True)
-        dP_f.sub_(D_dot).mul_(P_va_b).mul_(saved["scaling"])
-        del D_dot
-        dS = dP_f.to(dtype)                                                # [H_q, K_sub, T_v, T_full]
-        del dP_f
+        # 1-pass fused Triton softmax VJP: overwrites dP_htkt with dS and returns dS_vv_T [H_q, K_sub, T_v, T_v]!
+        dS_vv_T = qsa_softmax_bwd_fused(dP_htkt, P_va, s, saved["scaling"])
 
         # dQ[s:] = dS[s:, 0:T_full] @ K[0:T_full]
-        dQ_rot = torch.bmm(dS.view(H_q, K_sub * T_v, T_full), K_all).view(H_q, K_sub, T_v, Dh).transpose(0, 1)
+        dQ_rot = torch.bmm(dP_htkt.view(H_q, T_v * K_sub, T_full), K_all).view(H_q, T_v, K_sub, Dh).permute(2, 0, 1, 3)
+        del dP_htkt
 
-        # dK[s:] = dS[s:, s:]^T @ Q[s:] (causal: dS[q, k] = 0 for q < k)
-        dS_vv = dS[:, :, :, s:] if s > 0 else dS                           # [H_q, K_sub, T_v, T_v]
-        dK_rep = torch.bmm(
-            dS_vv.transpose(-1, -2).reshape(H_q, K_sub * T_v, T_v), Q_v
-        ).view(H_q, K_sub, T_v, Dh).transpose(0, 1)                         # [K_sub, H_q, T_v, Dh]
-        del dS, dS_vv
+        # dK[s:] = dS[s:, s:]^T @ Q[s:]
+        dK_rep = torch.bmm(dS_vv_T.view(H_q, K_sub * T_v, T_v), Q_v).view(H_q, K_sub, T_v, Dh).transpose(0, 1)
+        del dS_vv_T
+
+        # Reduce GQA heads H_q -> H_kv directly into final layouts
+        dK_rot = dK_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)       # [K_sub, H_kv, T_v, Dh]
+        dV_flat = dV_rep_htkd.view(H_kv, n_rep, T_v, K_sub, Dh).sum(dim=1).permute(2, 1, 0, 3).reshape(K_sub * T_v, H_kv * Dh)
+        del dK_rep, dV_rep_htkd
     else:
+        dO = d_attn_flat.view(K_sub, T_v, H_q, Dh).transpose(1, 2).contiguous()  # [K_sub, H_q, T_v, Dh]
+        del d_attn_flat
         with torch.enable_grad():
             q_e = saved["q_rot"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
             k_e = saved["k_rep"].detach().unsqueeze(0).expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
@@ -613,11 +613,9 @@ def qsa_layer_vjp(
                 dQ_rot = dQ_rot[:, :, s:, :]
                 dK_rep = dK_rep[:, :, s:, :]
                 dV_rep = dV_rep[:, :, s:, :]
-
-    # Reduce GQA heads H_q -> H_kv
-    dK_rot = dK_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)           # [K_sub, H_kv, T_v, Dh]
-    dV = dV_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)               # [K_sub, H_kv, T_v, Dh]
-    del dK_rep, dV_rep
+        dK_rot = dK_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2)
+        dV_flat = dV_rep.view(K_sub, H_kv, n_rep, T_v, Dh).sum(dim=2).transpose(1, 2).reshape(K_sub * T_v, H_kv * Dh)
+        del dK_rep, dV_rep
 
     # 3. Inverse partial RoPE on [s:]
     cos = saved["cos"][:, :, s:, :] if s > 0 else saved["cos"]
@@ -638,8 +636,7 @@ def qsa_layer_vjp(
     # 5. Pack [dQ_raw, d_gate] matching q_proj output layout [K_sub, T_v, H_q, 2*Dh]
     dQG = torch.cat([dQ_raw, d_gate.view(K_sub, T_v, H_q, Dh)], dim=-1).reshape(K_sub * T_v, H_q * Dh * 2)
     dK_flat = dK_raw.reshape(K_sub * T_v, H_kv * Dh)
-    dV_flat = dV.transpose(1, 2).reshape(K_sub * T_v, H_kv * Dh)
-    del dQ_raw, dK_raw, d_gate, dV
+    del dQ_raw, dK_raw, d_gate
 
     d_x_2d = torch.mm(dQG, w.q_proj)
     del dQG
@@ -669,6 +666,13 @@ def gdn_layer_fwd(
     a = F.linear(hidden_states, w.in_proj_a)  # [1, T, H_v]
 
     mixed_qkv_act, conv_pre_silu = causal_conv1d_silu_fwd(mixed_qkv, w.conv1d_weight)
+    # Precompute C-contiguous silu'(pre_silu)^T [T, C] & weight^T [4, C] ONCE per layer (<0.05 ms)
+    # so all 20 backward conv1d+SiLU chunks run 100%-coalesced with zero tl.exp() calls!
+    u_c = conv_pre_silu[0].float()
+    sig_c = torch.sigmoid(u_c)
+    conv_d_silu_tc = (sig_c * (1.0 + u_c * (1.0 - sig_c))).to(hidden_states.dtype).transpose(0, 1).contiguous()
+    conv_w_tc = w.conv1d_weight.transpose(0, 1).contiguous()
+
     mixed_qkv_t = mixed_qkv_act.transpose(1, 2)
     q, k, v = torch.split(mixed_qkv_t, [key_dim, key_dim, val_dim], dim=-1)
     q = q.reshape(B, T, w.num_k_heads, w.head_k_dim)
@@ -688,6 +692,8 @@ def gdn_layer_fwd(
 
     saved = {
         "conv_pre_silu": conv_pre_silu,
+        "conv_d_silu_tc": conv_d_silu_tc,
+        "conv_w_tc": conv_w_tc,
         "beta": beta,
         "neg_exp_A": neg_exp_A,
         "sig_a_plus_dt": torch.sigmoid(a_plus_dt),
@@ -710,18 +716,21 @@ def gdn_layer_vjp(
     s = int(bwd_start)
     val_dim = w.num_v_heads * w.head_v_dim
     dtype = d_out.dtype
+    use_htkd = saved["gdn_saved"].get("mode") == "l2_cached_wy"
 
-    # 1. out_proj & fused Triton RMSNormGated VJP on [s:]
+    # 1. out_proj & fused Triton RMSNormGated VJP (writes d_core_out directly as [H_v, T_v, K_sub, D] for WY!)
     d_norm_out = torch.mm(d_out.reshape(K_sub * T_v, D), w.out_proj).view(K_sub, T_v, w.num_v_heads, w.head_v_dim)
     if s > 0:
         norm_s = {k: (v[:, s:] if v.ndim == 4 else v) for k, v in saved["norm_saved"].items()}
     else:
         norm_s = saved["norm_saved"]
-    d_core_out, d_z = rmsnorm_gated_vjp(d_norm_out, norm_s)
+    d_core_out, d_z = rmsnorm_gated_vjp_fused(d_norm_out, norm_s, out_htkd=use_htkd)
     del d_norm_out
 
-    # 2. Core Gated Delta Rule VJP (zero-pad skipped for L2-cached WY!)
-    dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(saved["gdn_saved"], d_core_out, bwd_start=s)
+    # 2. Core Gated Delta Rule VJP (zero-copy HTKD + fused Triton WY kernels!)
+    dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(
+        saved["gdn_saved"], d_core_out, bwd_start=s, do_is_htkd=use_htkd
+    )
     del d_core_out
 
     # 3. Gate activations VJP on [s:]: beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
@@ -731,9 +740,13 @@ def gdn_layer_vjp(
     da = (dg.float() * saved["neg_exp_A"] * sig_adt).to(dtype)
     del dbeta, dg
 
-    # 4. Fused [dq, dk, dv] + SiLU + 4-tap causal conv1d VJP directly in [K_sub, T_v, conv_dim]!
+    # 4. 2D-tiled coalesced [dq, dk, dv] + SiLU + 4-tap causal conv1d VJP directly in [K_sub, T_v, conv_dim]!
     pre_silu_s = saved["conv_pre_silu"][:, :, s:] if s > 0 else saved["conv_pre_silu"]
-    d_conv_in = causal_conv1d_silu_bwd_qkv_ktc(dq, dk, dv, pre_silu_s, w.conv1d_weight)
+    ds_tc = saved.get("conv_d_silu_tc")
+    ds_tc_s = (ds_tc[s:] if (ds_tc is not None and s > 0) else ds_tc)
+    d_conv_in = causal_conv1d_silu_bwd_qkv_ktc(
+        dq, dk, dv, pre_silu_s, w.conv1d_weight, d_silu_tc=ds_tc_s, w_tc=saved.get("conv_w_tc")
+    )
     del dq, dk, dv
 
     # 5. Input projections VJP on [s:] via in-place addmm_ (zero intermediate [K_sub, T_v, D] buffers!)
@@ -968,9 +981,9 @@ def moe_block_vjp_all(
     w_sorted = saved["w_sorted"]
     inv_perm = saved["inv_perm"]
 
-    dX_TK = torch.zeros_like(dY_TK)
+    dX_TK = torch.empty_like(dY_TK)
 
-    # 1. Shared expert + router VJP (tiny dense BF16 ops -> run in K chunks, < 1 ms total)
+    # 1. Shared expert + router VJP (10-chunk BF16 Tensor-Core bmm + in-place addmm_; writes dX_TK directly!)
     y_exp_sorted = saved["y_exp_sorted"]  # [S, D]
     sh_out = saved["sh_out"]              # [T, D]
     sh_da_dg = saved["sh_da_dg"]          # [T, sh_inter]
@@ -983,47 +996,48 @@ def moe_block_vjp_all(
     p_dot_W = saved["p_dot_W_router"]     # [T, D]
     W_r_top = saved["W_router_top"]       # [T, k, D]
 
-    # Token-major view of the routed expert outputs: y_exp_tok[t, r] = y_exp_sorted[slot(t, r)].
-    # Built ONCE per layer ([T, k, D] fp32 = 11 MB at T_v=112) so the router VJP becomes ONE batched
-    # GEMM per K chunk instead of gathering a [S, K_blk, D] copy of dY (+ two fp32 casts = 6.84 GiB!).
-    y_exp_tok_f = y_exp_sorted[inv_perm].view(T, top_k, D).float()   # [T, k, D] fp32
-    sh_out_f = sh_out.float().unsqueeze(-1)                           # [T, D, 1] fp32
+    # Pack [sh_out, y_exp_tok[0..top_k-1]] -> [T, D, 1 + top_k] in compute dtype (BF16 Tensor Cores
+    # accumulate in FP32 internally -> 1 bmm computes BOTH d_sg_logit & dw with ZERO dy_tk.float() cast!)
+    y_exp_tok = y_exp_sorted[inv_perm].view(T, top_k, D)  # [T, k, D]
+    sh_and_exp_T = torch.cat([sh_out.unsqueeze(1), y_exp_tok], dim=1).transpose(1, 2).contiguous()  # [T, D, 1+k]
+    del y_exp_tok
 
-    # Small dense ops: 64-wide K chunks keep every fp32 temp <= 0.07 GiB at T_v=112.
-    dense_k_chunk = min(64, moe_k_chunk)
+    dense_k_chunk = moe_k_chunk
     for k0 in range(0, K_total, dense_k_chunk):
         k1 = min(k0 + dense_k_chunk, K_total)
-        dy_tk = dY_TK[:, k0:k1, :]  # [T, K_blk, D] (view)
-        dy_f = dy_tk.float()        # [T, K_blk, D] fp32 (shared by gate-logit & router dot products)
+        K_blk = k1 - k0
+        dy_tk = dY_TK[:, k0:k1, :].contiguous()  # [T, K_blk, D]
 
-        # 1a. Shared expert VJP
-        # d_sg_logit[t, k] = <dY[t, k, :], sh_out[t, :]> * sigmoid'(.) -> exact fp32 batched dot product
-        d_sg_logit = torch.bmm(dy_f, sh_out_f).to(dtype) * d_sg.unsqueeze(1)  # [T, K_blk, 1]
-        d_sh_act = torch.matmul(dy_tk * sg_val.unsqueeze(1), dense.shared_down_proj)  # [T, K_blk, sh_inter]
-        dx_acc = torch.matmul(d_sh_act * sh_da_dg.unsqueeze(1), dense.shared_gate_proj)
-        dx_acc.add_(torch.matmul(d_sh_act * sh_da_du.unsqueeze(1), dense.shared_up_proj))
+        # Single Tensor-Core BF16 bmm (FP32 internal accum) -> [T, K_blk, 1 + k]
+        dots = torch.bmm(dy_tk, sh_and_exp_T)
+        d_sg_logit = dots[:, :, :1] * d_sg.unsqueeze(1)  # [T, K_blk, 1]
+        dw = dots[:, :, 1:].float()                      # [T, K_blk, k] fp32
+        del dots
+
+        # 1a. Shared expert VJP (in-place addmm_ avoids 2 extra [T, K_blk, D] buffers!)
+        d_sh_act = torch.mm((dy_tk * sg_val.unsqueeze(1)).reshape(T * K_blk, D), dense.shared_down_proj).view(T, K_blk, -1)
+        del dy_tk
+        dx_2d = torch.mm((d_sh_act * sh_da_dg.unsqueeze(1)).reshape(T * K_blk, -1), dense.shared_gate_proj)
+        dx_2d.addmm_((d_sh_act * sh_da_du.unsqueeze(1)).reshape(T * K_blk, -1), dense.shared_up_proj)
         del d_sh_act
-        dx_acc.add_(torch.matmul(d_sg_logit, dense.shared_expert_gate))
+        dx_2d.addmm_(d_sg_logit.reshape(T * K_blk, 1), dense.shared_expert_gate)
         del d_sg_logit
+        dx_acc = dx_2d.view(T, K_blk, D)
 
-        # 1b. Exact Top-K Router VJP (without materializing [T, K_blk, 512] or [S, K_blk, D]!)
-        # dw[t, k, r] = <dY[t, k, :], y_exp[slot(t, r), :]>  ->  [T, K_blk, D] @ [T, D, k]
-        dw = torch.bmm(dy_f, y_exp_tok_f.transpose(1, 2))  # [T, K_blk, k] fp32
-        del dy_f
+        # 1b. Exact Top-K Router VJP
         if top_sum is not None:
             dot_w = (dw * rw_f.unsqueeze(1)).sum(dim=-1, keepdim=True)
             d_top_v = (dw - dot_w) / top_sum.unsqueeze(1)
         else:
             d_top_v = dw
-        # Softmax VJP: sum_e p_e (dp_e - dot_p) W_e = sum_r (p_r * d_top_v_r) W_{idx_r} - dot_p * (p @ W)
         p_times_dv = d_top_v * top_vals_raw.unsqueeze(1)  # [T, K_blk, k] fp32
         dot_p = p_times_dv.sum(dim=-1, keepdim=True)      # [T, K_blk, 1] fp32
-        dx_acc.add_(torch.bmm(p_times_dv.to(dtype), W_r_top))
+        dx_acc.baddbmm_(p_times_dv.to(dtype), W_r_top)
         dx_acc.sub_(dot_p.to(dtype) * p_dot_W.unsqueeze(1))
         del dw, d_top_v, p_times_dv, dot_p
-        dX_TK[:, k0:k1, :].add_(dx_acc)
-        del dx_acc
-    del y_exp_tok_f, sh_out_f
+        dX_TK[:, k0:k1, :] = dx_acc
+        del dx_acc, dx_2d
+    del sh_and_exp_T
 
     # 2. Routed experts VJP (each expert chunk dequantized ONLY ONCE across ALL K_total!)
     da_dg_sorted = saved["da_dg_sorted"]
@@ -1290,8 +1304,8 @@ def decoder_layer_vjp_inplace(
     saved["moe_saved"]["cached_W_gu"] = None
     saved["moe_saved"]["cached_W_dn"] = None
 
-    # Fused Triton HC VJP + fused in-place RMSNorm VJP straight into G[k0:k1] (0 FP32 temps -> 128-wide safe!)
-    hc_k_chunk = min(128, moe_k_chunk) if (use_triton_swiglu and G.is_cuda) else min(64, moe_k_chunk)
+    # Fused Triton HC VJP + fused in-place RMSNorm VJP straight into G[k0:k1] (0 FP32 temps -> 256-wide safe!)
+    hc_k_chunk = min(256, moe_k_chunk) if (use_triton_swiglu and G.is_cuda) else min(64, moe_k_chunk)
     for k0 in range(0, K_total, hc_k_chunk):
         k1 = min(k0 + hc_k_chunk, K_total)
         gated_residual_vjp(

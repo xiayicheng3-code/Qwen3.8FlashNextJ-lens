@@ -267,32 +267,40 @@ if _HAS_TRITON:
 
     @triton.jit
     def _rmsnorm_gated_vjp_kernel(
-        dy_ptr,       # [K, R, D] bf16
-        normed_ptr,   # [R, D] fp32
-        dact_ptr,     # [R, D] fp32
-        act_ptr,      # [R, D] fp32
-        xh_ptr,       # [R, D] fp32
-        rstd_ptr,     # [R] fp32
+        dy_ptr,       # [K, T, H, D] bf16
+        normed_ptr,   # [T*H, D] fp32
+        dact_ptr,     # [T*H, D] fp32
+        act_ptr,      # [T*H, D] fp32
+        xh_ptr,       # [T*H, D] fp32
+        rstd_ptr,     # [T*H] fp32
         w_ptr,        # [D] fp32
-        dx_ptr,       # [K, R, D] bf16
-        dgate_ptr,    # [K, R, D] bf16
+        dx_ptr,       # [K, T, H, D] or [H, T, K, D] bf16
+        dgate_ptr,    # [K, T, H, D] bf16
+        H,
         D,
         stride_dy_k,
-        stride_dy_r,
+        stride_dy_t,
+        stride_dy_h,
+        stride_dx_k,
+        stride_dx_t,
+        stride_dx_h,
         stride_r,
         BLOCK_D: tl.constexpr,
     ):
-        """Single-pass register-resident VJP for GDN `RMSNormGated` (`D=128`)."""
+        """Single-pass register-resident VJP for GDN `RMSNormGated` (`D=128`) with direct `[H, T, K, D]` output."""
         pid_k = tl.program_id(0).to(tl.int64)
-        pid_r = tl.program_id(1).to(tl.int64)
+        pid_t = tl.program_id(1).to(tl.int64)
+        pid_h = tl.program_id(2).to(tl.int64)
+        pid_r = pid_t * H + pid_h
 
         offs_d = tl.arange(0, BLOCK_D)
         mask = offs_d < D
 
-        kr_off = pid_k * stride_dy_k + pid_r * stride_dy_r + offs_d
+        dy_off = pid_k * stride_dy_k + pid_t * stride_dy_t + pid_h * stride_dy_h + offs_d
+        dx_off = pid_k * stride_dx_k + pid_t * stride_dx_t + pid_h * stride_dx_h + offs_d
         r_off = pid_r * stride_r + offs_d
 
-        dy = tl.load(dy_ptr + kr_off, mask=mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptr + dy_off, mask=mask, other=0.0).to(tl.float32)
         normed = tl.load(normed_ptr + r_off, mask=mask, other=0.0).to(tl.float32)
         dact = tl.load(dact_ptr + r_off, mask=mask, other=0.0).to(tl.float32)
         act = tl.load(act_ptr + r_off, mask=mask, other=0.0).to(tl.float32)
@@ -300,11 +308,11 @@ if _HAS_TRITON:
         wf = tl.load(w_ptr + offs_d, mask=mask, other=0.0).to(tl.float32)
         rstd = tl.load(rstd_ptr + pid_r).to(tl.float32)
 
-        tl.store(dgate_ptr + kr_off, (dy * normed * dact).to(tl.bfloat16), mask=mask)
+        tl.store(dgate_ptr + dy_off, (dy * normed * dact).to(tl.bfloat16), mask=mask)
         g = dy * act * wf
         dot = tl.sum(g * xh, axis=0) / D
         dx = rstd * (g - xh * dot)
-        tl.store(dx_ptr + kr_off, dx.to(tl.bfloat16), mask=mask)
+        tl.store(dx_ptr + dx_off, dx.to(tl.bfloat16), mask=mask)
 
     @triton.jit
     def _hc_bwd_prep_kernel(
@@ -526,45 +534,297 @@ if _HAS_TRITON:
         tl.store(dx_ptr + kr_off, (rstd * (dyf - yf * dot)).to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def _causal_conv1d_silu_bwd_slice_kernel(
+    def _causal_conv1d_silu_bwd_tc_kernel(
         in_ptr,       # [K, T, C_slice] bf16
-        pre_ptr,      # [C_slice, T] bf16/fp32 (sliced view of pre_silu[0, c_lo:c_hi, :])
-        w_ptr,        # [C_slice, 4] bf16 (sliced view of weight[c_lo:c_hi, :])
+        ds_tc_ptr,    # [T, C_slice] bf16 (C-contiguous view of precomputed silu'(pre_silu)^T)
+        w_tc_ptr,     # [4, C_slice] bf16 (C-contiguous view of weight^T)
         out_ptr,      # [K, T, C_total] bf16 (offset to c_lo)
+        K,
         T,
         C_slice,
         stride_ik,
         stride_it,
-        stride_pc,
-        stride_pt,
-        stride_wc,
+        stride_dst,
         stride_wk,
         stride_ok,
         stride_ot,
+        BLOCK_K: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """Fused 4-tap causal depthwise conv1d + SiLU VJP directly in `[K, T, C]` (zero transposes/conv_transpose1d)."""
-        pid_k = tl.program_id(0).to(tl.int64)
+        """2D-tiled, 100%-coalesced 4-tap causal conv1d + SiLU VJP directly in `[K, T, C]` (zero exp, 8x weight reuse)."""
+        pid_kb = tl.program_id(0).to(tl.int64)
         pid_t = tl.program_id(1).to(tl.int64)
         pid_c = tl.program_id(2).to(tl.int64)
 
+        offs_k = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
         offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask_k = offs_k < K
         mask_c = offs_c < C_slice
+        mask_kc = mask_k[:, None] & mask_c[None, :]
+        offs_k64 = offs_k.to(tl.int64)
         offs_c64 = offs_c.to(tl.int64)
 
-        acc = tl.zeros([BLOCK_C], dtype=tl.float32)
-        in_k_base = in_ptr + pid_k * stride_ik
+        acc = tl.zeros([BLOCK_K, BLOCK_C], dtype=tl.float32)
         for tap in tl.static_range(4):
             t_src = pid_t + tap
             if t_src < T:
-                w_tap = tl.load(w_ptr + offs_c64 * stride_wc + (3 - tap) * stride_wk, mask=mask_c, other=0.0).to(tl.float32)
-                u = tl.load(pre_ptr + offs_c64 * stride_pc + t_src * stride_pt, mask=mask_c, other=0.0).to(tl.float32)
-                sig = 1.0 / (1.0 + tl.exp(-u))
-                d_silu = sig * (1.0 + u * (1.0 - sig))
-                d_in = tl.load(in_k_base + t_src * stride_it + offs_c64, mask=mask_c, other=0.0).to(tl.float32)
-                acc = acc + w_tap * d_in * d_silu
+                w_tap = tl.load(w_tc_ptr + (3 - tap) * stride_wk + offs_c64, mask=mask_c, other=0.0).to(tl.float32)
+                ds = tl.load(ds_tc_ptr + t_src * stride_dst + offs_c64, mask=mask_c, other=0.0).to(tl.float32)
+                coeff = w_tap * ds
+                d_in = tl.load(
+                    in_ptr + offs_k64[:, None] * stride_ik + t_src * stride_it + offs_c64[None, :],
+                    mask=mask_kc,
+                    other=0.0,
+                ).to(tl.float32)
+                acc = acc + d_in * coeff[None, :]
 
-        tl.store(out_ptr + pid_k * stride_ok + pid_t * stride_ot + offs_c64, acc.to(tl.bfloat16), mask=mask_c)
+        tl.store(
+            out_ptr + offs_k64[:, None] * stride_ok + pid_t * stride_ot + offs_c64[None, :],
+            acc.to(tl.bfloat16),
+            mask=mask_kc,
+        )
+
+    @triton.jit
+    def _wy_gdn_dA_dL_fuse_kernel(
+        dm_ptr,       # [H_v, Tv, K, T] bf16 — OVERWRITTEN IN-PLACE WITH dS!
+        mf_ptr,       # [H_v, Tv, T] fp32 (A_va_f or L_va_f)
+        pb_ptr,       # [H_v, Tv, T] bf16 (pair_lo or pair_st)
+        dst_ptr,      # [H_v, K, Tv, Tv] bf16 — OUTPUT dS_vv_T[h, k, j_local, i]!
+        dcum_ptr,     # [H_v, K, Tv] fp32 — OUTPUT / ACCUM d_cum_v!
+        Tv,
+        T,
+        s_off,
+        stride_dm_h,
+        stride_dm_i,
+        stride_dm_k,
+        stride_mf_h,
+        stride_mf_i,
+        stride_pb_h,
+        stride_pb_i,
+        stride_dst_h,
+        stride_dst_k,
+        stride_dst_j,
+        stride_dc_h,
+        stride_dc_k,
+        BLOCK_I: tl.constexpr,
+        BLOCK_J: tl.constexpr,
+        NEGATE: tl.constexpr,
+        ADD_CUM: tl.constexpr,
+    ):
+        """Fused WY GDN Branch-A / Branch-L kernel: computes `d_cum_v` in registers (0 FP32 HBM temps!),
+        overwrites `dm` in-place with `dS`, and writes transposed `dS_vv_T` in one pass!"""
+        pid_h = tl.program_id(0).to(tl.int64)
+        pid_k = tl.program_id(1).to(tl.int64)
+
+        offs_j = tl.arange(0, BLOCK_J)
+        mask_j = offs_j < T
+        offs_j64 = offs_j.to(tl.int64)
+        j_local = offs_j - s_off
+        m_j_vv = (offs_j >= s_off) & (offs_j < T)
+        safe_jl = tl.where(m_j_vv, j_local, 0).to(tl.int64)
+
+        dm_hk = dm_ptr + pid_h * stride_dm_h + pid_k * stride_dm_k
+        mf_h = mf_ptr + pid_h * stride_mf_h
+        pb_h = pb_ptr + pid_h * stride_pb_h
+        dst_hk = dst_ptr + pid_h * stride_dst_h + pid_k * stride_dst_k
+        dcum_hk = dcum_ptr + pid_h * stride_dc_h + pid_k * stride_dc_k
+
+        col_acc = tl.zeros([BLOCK_J], dtype=tl.float32)
+
+        for i0 in range(0, Tv, BLOCK_I):
+            offs_i = i0 + tl.arange(0, BLOCK_I)
+            mask_i = offs_i < Tv
+            offs_i64 = offs_i.to(tl.int64)
+            mask_ij = mask_i[:, None] & mask_j[None, :]
+
+            dm_ptrs = dm_hk + offs_i64[:, None] * stride_dm_i + offs_j64[None, :]
+            dm = tl.load(dm_ptrs, mask=mask_ij, other=0.0).to(tl.float32)
+            if NEGATE:
+                dm = -dm
+            mf = tl.load(mf_h + offs_i64[:, None] * stride_mf_i + offs_j64[None, :], mask=mask_ij, other=0.0)
+            pb = tl.load(pb_h + offs_i64[:, None] * stride_pb_i + offs_j64[None, :], mask=mask_ij, other=0.0).to(tl.float32)
+
+            dlp = dm * mf
+            row_sum = tl.sum(dlp, axis=1)
+            col_acc = col_acc + tl.sum(dlp, axis=0)
+            if ADD_CUM:
+                row_sum = row_sum + tl.load(dcum_hk + offs_i64, mask=mask_i, other=0.0)
+            tl.store(dcum_hk + offs_i64, row_sum, mask=mask_i)
+
+            ds_bf16 = (dm * pb).to(tl.bfloat16)
+            tl.store(dm_ptrs, ds_bf16, mask=mask_ij)
+
+            mask_ji = m_j_vv[:, None] & mask_i[None, :]
+            dst_ptrs = dst_hk + safe_jl[:, None] * stride_dst_j + offs_i64[None, :]
+            tl.store(dst_ptrs, tl.trans(ds_bf16), mask=mask_ji)
+
+        dc_ptrs = dcum_hk + safe_jl
+        cur = tl.load(dc_ptrs, mask=m_j_vv, other=0.0)
+        tl.store(dc_ptrs, cur - col_acc, mask=m_j_vv)
+
+    @triton.jit
+    def _wy_gdn_post_v_beta_kernel(
+        dvb_ptr,      # [H_v, Tv, K, D] bf16
+        dkb_ptr,      # [H_v, Tv, K, D] bf16
+        vf_ptr,       # [H_v, Tv, D] bf16
+        kf_ptr,       # [H_v, Tv, D] bf16
+        bf_ptr,       # [H_v, Tv] bf16
+        dv_out_ptr,   # [K, Tv, H_v, D] bf16
+        db_out_ptr,   # [K, Tv, H_v] bf16
+        D,
+        stride_htkd_h,
+        stride_htkd_t,
+        stride_htkd_k,
+        stride_htd_h,
+        stride_htd_t,
+        stride_bf_h,
+        stride_dv_k,
+        stride_dv_t,
+        stride_dv_h,
+        stride_db_k,
+        stride_db_t,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused WY GDN `dV` & `d_beta` directly into final `[K, Tv, H_v, D]` & `[K, Tv, H_v]` layouts."""
+        pid_k = tl.program_id(0).to(tl.int64)
+        pid_t = tl.program_id(1).to(tl.int64)
+        pid_h = tl.program_id(2).to(tl.int64)
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask = offs_d < D
+
+        htkd_off = pid_h * stride_htkd_h + pid_t * stride_htkd_t + pid_k * stride_htkd_k + offs_d
+        htd_off = pid_h * stride_htd_h + pid_t * stride_htd_t + offs_d
+
+        dvb = tl.load(dvb_ptr + htkd_off, mask=mask, other=0.0).to(tl.float32)
+        dkb = tl.load(dkb_ptr + htkd_off, mask=mask, other=0.0).to(tl.float32)
+        vf = tl.load(vf_ptr + htd_off, mask=mask, other=0.0).to(tl.float32)
+        kf = tl.load(kf_ptr + htd_off, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(bf_ptr + pid_h * stride_bf_h + pid_t).to(tl.float32)
+
+        tl.store(
+            dv_out_ptr + pid_k * stride_dv_k + pid_t * stride_dv_t + pid_h * stride_dv_h + offs_d,
+            (dvb * b).to(tl.bfloat16),
+            mask=mask,
+        )
+        db = tl.sum(dvb * vf + dkb * kf, axis=0)
+        tl.store(db_out_ptr + pid_k * stride_db_k + pid_t * stride_db_t + pid_h, db.to(tl.bfloat16))
+
+    @triton.jit
+    def _wy_gdn_reduce_l2norm_kernel(
+        dqk_ptr,      # [H_v, ...] bf16 (strided by h, k, t; D contiguous)
+        dkb_ptr,      # [H_v, ...] bf16 (only loaded when HAS_KB)
+        bf_ptr,       # [H_v, Tv] bf16 (only loaded when HAS_KB)
+        xn_ptr,       # [Tv, H_k, D] bf16
+        rstd_ptr,     # [Tv, H_k] fp32
+        out_ptr,      # [K, Tv, H_k, D] bf16
+        D,
+        SCALE,
+        stride_m_h,
+        stride_m_k,
+        stride_m_t,
+        stride_kb_h,
+        stride_kb_k,
+        stride_kb_t,
+        stride_bf_h,
+        stride_xn_t,
+        stride_xn_h,
+        stride_rs_t,
+        stride_o_k,
+        stride_o_t,
+        stride_o_h,
+        BLOCK_D: tl.constexpr,
+        REP: tl.constexpr,
+        HAS_KB: tl.constexpr,
+    ):
+        """Fused GVA head reduction (`H_v -> H_k`) + optional `dK += d_kb * beta` + `scale` + L2Norm VJP."""
+        pid_k = tl.program_id(0).to(tl.int64)
+        pid_t = tl.program_id(1).to(tl.int64)
+        pid_hk = tl.program_id(2).to(tl.int64)
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask = offs_d < D
+
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for r in tl.static_range(REP):
+            h = pid_hk * REP + r
+            v = tl.load(
+                dqk_ptr + h * stride_m_h + pid_k * stride_m_k + pid_t * stride_m_t + offs_d,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            if HAS_KB:
+                kb = tl.load(
+                    dkb_ptr + h * stride_kb_h + pid_k * stride_kb_k + pid_t * stride_kb_t + offs_d,
+                    mask=mask,
+                    other=0.0,
+                ).to(tl.float32)
+                b = tl.load(bf_ptr + h * stride_bf_h + pid_t).to(tl.float32)
+                v = v + kb * b
+            acc = acc + v
+
+        dyf = acc * SCALE
+        yf = tl.load(xn_ptr + pid_t * stride_xn_t + pid_hk * stride_xn_h + offs_d, mask=mask, other=0.0).to(tl.float32)
+        rstd = tl.load(rstd_ptr + pid_t * stride_rs_t + pid_hk).to(tl.float32)
+        dot = tl.sum(dyf * yf, axis=0)
+        tl.store(
+            out_ptr + pid_k * stride_o_k + pid_t * stride_o_t + pid_hk * stride_o_h + offs_d,
+            (rstd * (dyf - yf * dot)).to(tl.bfloat16),
+            mask=mask,
+        )
+
+    @triton.jit
+    def _qsa_softmax_bwd_inplace_kernel(
+        dp_ptr,       # [H_q, Tv, K, T_full] bf16 — OVERWRITTEN IN-PLACE WITH dS!
+        p_ptr,        # [H_q, Tv, T_full] fp32 (P_va)
+        dst_ptr,      # [H_q, K, Tv, Tv] bf16 — OUTPUT dS_vv_T[h, k, j_local, i]!
+        Tv,
+        T_full,
+        s_off,
+        SCALE,
+        stride_dp_h,
+        stride_dp_i,
+        stride_dp_k,
+        stride_p_h,
+        stride_p_i,
+        stride_dst_h,
+        stride_dst_k,
+        stride_dst_j,
+        BLOCK_I: tl.constexpr,
+        BLOCK_J: tl.constexpr,
+    ):
+        """1-pass fused QSA softmax VJP: overwrites `dP` in-place with `dS` and writes `dS_vv_T` (0 FP32 temps)."""
+        pid_h = tl.program_id(0).to(tl.int64)
+        pid_k = tl.program_id(1).to(tl.int64)
+
+        offs_j = tl.arange(0, BLOCK_J)
+        mask_j = offs_j < T_full
+        offs_j64 = offs_j.to(tl.int64)
+        j_local = offs_j - s_off
+        m_j_vv = (offs_j >= s_off) & (offs_j < T_full)
+        safe_jl = tl.where(m_j_vv, j_local, 0).to(tl.int64)
+
+        dp_hk = dp_ptr + pid_h * stride_dp_h + pid_k * stride_dp_k
+        p_h = p_ptr + pid_h * stride_p_h
+        dst_hk = dst_ptr + pid_h * stride_dst_h + pid_k * stride_dst_k
+
+        for i0 in range(0, Tv, BLOCK_I):
+            offs_i = i0 + tl.arange(0, BLOCK_I)
+            mask_i = offs_i < Tv
+            offs_i64 = offs_i.to(tl.int64)
+            mask_ij = mask_i[:, None] & mask_j[None, :]
+
+            dp_ptrs = dp_hk + offs_i64[:, None] * stride_dp_i + offs_j64[None, :]
+            dp = tl.load(dp_ptrs, mask=mask_ij, other=0.0).to(tl.float32)
+            p = tl.load(p_h + offs_i64[:, None] * stride_p_i + offs_j64[None, :], mask=mask_ij, other=0.0)
+
+            dot = tl.sum(dp * p, axis=1)[:, None]
+            ds_bf16 = (p * (dp - dot) * SCALE).to(tl.bfloat16)
+            tl.store(dp_ptrs, ds_bf16, mask=mask_ij)
+
+            mask_ji = m_j_vv[:, None] & mask_i[None, :]
+            dst_ptrs = dst_hk + safe_jl[:, None] * stride_dst_j + offs_i64[None, :]
+            tl.store(dst_ptrs, tl.trans(ds_bf16), mask=mask_ji)
 
 
 def dequantize_fp8_blockwise(
@@ -751,7 +1011,7 @@ def rmsnorm_vjp_fused(
         else:
             out_3d = torch.empty_like(dy_3d)
             add_inplace = False
-        block_d = min(512, triton.next_power_of_2(D))
+        block_d = min(1024, triton.next_power_of_2(D))
         single_pass = D <= block_d
         _rmsnorm_vjp_kernel[(K, R)](
             dy_3d,
@@ -771,7 +1031,7 @@ def rmsnorm_vjp_fused(
             BLOCK_D=block_d,
             SINGLE_PASS=single_pass,
             ADD_INPLACE=add_inplace,
-            num_warps=4,
+            num_warps=8 if block_d >= 1024 else 4,
         )
         return out_add if out_add is not None else out_3d.reshape(orig_dy_shape)
 
@@ -800,40 +1060,55 @@ def rmsnorm_gated_vjp_fused(
     dy: torch.Tensor,  # [K, T, H_v, D_v]
     saved: dict[str, torch.Tensor],
     *,
+    out_htkd: bool = False,
     use_triton: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Single-pass fused Triton VJP for GDN `RMSNormGated` -> `(dx, dgate)`."""
+    """Single-pass fused Triton VJP for GDN `RMSNormGated` -> `(dx, dgate)`.
+
+    When `out_htkd=True`, writes `dx` directly in `[H_v, T, K, D_v]` layout so L2-cached WY GDN
+    runs with ZERO `do.permute().contiguous()` copy!
+    """
     K, T, H_v, D_v = dy.shape
     if use_triton and _HAS_TRITON and dy.is_cuda and dy.dtype == torch.bfloat16 and D_v <= 512:
         R = T * H_v
-        dy_3d = dy.contiguous().reshape(K, R, D_v)
+        dy_c = dy.contiguous()
         normed_2d = saved["normed"].contiguous().reshape(R, D_v)
         dact_2d = saved["d_act_g"].contiguous().reshape(R, D_v)
         act_2d = saved["act_g"].contiguous().reshape(R, D_v)
         xh_2d = saved["x_hat_f"].contiguous().reshape(R, D_v)
         rstd_1d = saved["rstd"].contiguous().reshape(R)
         wf_1d = saved["weight_f"].contiguous().reshape(D_v)
-        dx_3d = torch.empty_like(dy_3d)
-        dgate_3d = torch.empty_like(dy_3d)
+        dgate = torch.empty_like(dy_c)
+        if out_htkd:
+            dx = torch.empty((H_v, T, K, D_v), device=dy.device, dtype=torch.bfloat16)
+            s_dx_k, s_dx_t, s_dx_h = dx.stride(2), dx.stride(1), dx.stride(0)
+        else:
+            dx = torch.empty_like(dy_c)
+            s_dx_k, s_dx_t, s_dx_h = dx.stride(0), dx.stride(1), dx.stride(2)
         block_d = triton.next_power_of_2(D_v)
-        _rmsnorm_gated_vjp_kernel[(K, R)](
-            dy_3d,
+        _rmsnorm_gated_vjp_kernel[(K, T, H_v)](
+            dy_c,
             normed_2d,
             dact_2d,
             act_2d,
             xh_2d,
             rstd_1d,
             wf_1d,
-            dx_3d,
-            dgate_3d,
+            dx,
+            dgate,
+            H_v,
             D_v,
-            dy_3d.stride(0),
-            dy_3d.stride(1),
+            dy_c.stride(0),
+            dy_c.stride(1),
+            dy_c.stride(2),
+            s_dx_k,
+            s_dx_t,
+            s_dx_h,
             normed_2d.stride(0),
             BLOCK_D=block_d,
-            num_warps=4,
+            num_warps=2 if block_d <= 128 else 4,
         )
-        return dx_3d.reshape(K, T, H_v, D_v), dgate_3d.reshape(K, T, H_v, D_v)
+        return dx, dgate
 
     dyf = dy.to(torch.float32, copy=True)
     d_gate = (dyf * saved["normed"] * saved["d_act_g"]).to(dy.dtype)
@@ -845,7 +1120,63 @@ def rmsnorm_gated_vjp_fused(
     dyf.mul_(saved["rstd"])
     dx = dyf.to(dy.dtype)
     del dyf
+    if out_htkd:
+        dx = dx.permute(2, 1, 0, 3).contiguous()
     return dx, d_gate
+
+
+def qsa_softmax_bwd_fused(
+    dP_htkt: torch.Tensor,   # [H_q, Tv, K_sub, T_full] — OVERWRITTEN IN-PLACE WITH dS!
+    P_va: torch.Tensor,      # [H_q, Tv, T_full] fp32
+    bwd_start: int,
+    scaling: float,
+    *,
+    use_triton: bool = True,
+) -> torch.Tensor:
+    """1-pass fused QSA softmax VJP: overwrites `dP_htkt` with `dS` and returns `dS_vv_T` `[H_q, K_sub, Tv, Tv]`."""
+    H_q, Tv, K_sub, T_full = dP_htkt.shape
+    s = int(bwd_start)
+    if (
+        use_triton
+        and _HAS_TRITON
+        and dP_htkt.is_cuda
+        and dP_htkt.dtype == torch.bfloat16
+        and dP_htkt.is_contiguous()
+        and T_full <= 512
+    ):
+        P_c = P_va.contiguous()
+        dS_vv_T = torch.empty((H_q, K_sub, Tv, Tv), device=dP_htkt.device, dtype=torch.bfloat16)
+        block_j = triton.next_power_of_2(T_full)
+        _qsa_softmax_bwd_inplace_kernel[(H_q, K_sub)](
+            dP_htkt,
+            P_c,
+            dS_vv_T,
+            Tv,
+            T_full,
+            s,
+            float(scaling),
+            dP_htkt.stride(0),
+            dP_htkt.stride(1),
+            dP_htkt.stride(2),
+            P_c.stride(0),
+            P_c.stride(1),
+            dS_vv_T.stride(0),
+            dS_vv_T.stride(1),
+            dS_vv_T.stride(2),
+            BLOCK_I=16,
+            BLOCK_J=block_j,
+            num_warps=4,
+        )
+        return dS_vv_T
+
+    dP_f = dP_htkt.float()
+    P_b = P_va.unsqueeze(2)  # [H_q, Tv, 1, T_full]
+    D_dot = (dP_f * P_b).sum(dim=-1, keepdim=True)
+    dP_f.sub_(D_dot).mul_(P_b).mul_(scaling)
+    dP_htkt.copy_(dP_f.to(dP_htkt.dtype))
+    del dP_f, D_dot
+    dS_vv = dP_htkt[:, :, :, s:] if s > 0 else dP_htkt  # [H_q, Tv_i, K_sub, Tv_j]
+    return dS_vv.permute(0, 2, 3, 1).contiguous()        # [H_q, K_sub, Tv_j, Tv_i]
 
 
 def hc_bwd_prep_fused(
@@ -1248,13 +1579,19 @@ def wy_gdn_fwd_single(
 
 def wy_gdn_bwd_batched(
     saved: dict[str, Any],
-    do: torch.Tensor,  # [K_sub, T_v, H_v, D]
+    do: torch.Tensor,  # [K_sub, T_v, H_v, D] (or [H_v, T_v, K_sub, D] when do_is_htkd=True)
     *,
     bwd_start: int = 0,
+    do_is_htkd: bool = False,
     use_triton: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact L2-cached WY GDN VJP on suffix `[bwd_start:]` via 6 pure cuBLAS `torch.bmm`s."""
-    K_sub, Tv, H_v, D = do.shape
+    """Exact L2-cached WY GDN VJP on suffix `[bwd_start:]` via zero-copy cuBLAS `bmm`s + 3 fused Triton kernels."""
+    if do_is_htkd:
+        H_v, Tv, K_sub, D = do.shape
+        dO_htkd = do.contiguous()
+    else:
+        K_sub, Tv, H_v, D = do.shape
+        dO_htkd = do.permute(2, 1, 0, 3).contiguous()
     H_k = saved["H_k"]
     T = saved["T"]
     rep = H_v // H_k
@@ -1262,29 +1599,218 @@ def wy_gdn_bwd_batched(
     assert Tv == T - s, f"Expected T_v={T - s}, got {Tv}"
     dtype = do.dtype
 
-    dO_h = do.permute(2, 0, 1, 3).contiguous()  # [H_v, K_sub, Tv, D]
-    W_vv_b = saved["W_eff_b"][:, s:, s:] if s > 0 else saved["W_eff_b"]
+    W_vv_b = (saved["W_eff_b"][:, s:, s:] if s > 0 else saved["W_eff_b"]).contiguous()
     U_b = saved["U_b"]
     kf_b = saved["kf_b"]
-    qf_v_b = saved["qf_b"][:, s:, :] if s > 0 else saved["qf_b"]
-    kb_v_b = saved["kb_b"][:, s:, :] if s > 0 else saved["kb_b"]
-    vf_v_b = saved["vf_b"][:, s:, :] if s > 0 else saved["vf_b"]
-    kf_v_b = kf_b[:, s:, :] if s > 0 else kf_b
-    p_lo_b = (saved["pair_lo_b"][:, s:, :] if s > 0 else saved["pair_lo_b"]).unsqueeze(1)
-    p_st_b = (saved["pair_st_b"][:, s:, :] if s > 0 else saved["pair_st_b"]).unsqueeze(1)
-    A_va_f = (saved["A_f"][:, s:, :] if s > 0 else saved["A_f"]).unsqueeze(1)
-    L_va_f = (saved["L_strict_f"][:, s:, :] if s > 0 else saved["L_strict_f"]).unsqueeze(1)
+    qf_v_b = (saved["qf_b"][:, s:, :] if s > 0 else saved["qf_b"]).contiguous()
+    kb_v_b = (saved["kb_b"][:, s:, :] if s > 0 else saved["kb_b"]).contiguous()
+    vf_v_b = (saved["vf_b"][:, s:, :] if s > 0 else saved["vf_b"]).contiguous()
+    kf_v_b = (kf_b[:, s:, :] if s > 0 else kf_b).contiguous()
+    bf_v_b = (saved["bf_b"][:, s:] if s > 0 else saved["bf_b"]).contiguous()
+    p_lo_v = (saved["pair_lo_b"][:, s:, :] if s > 0 else saved["pair_lo_b"]).contiguous()
+    p_st_v = (saved["pair_st_b"][:, s:, :] if s > 0 else saved["pair_st_b"]).contiguous()
+    A_va_f = (saved["A_f"][:, s:, :] if s > 0 else saved["A_f"]).contiguous()
+    L_va_f = (saved["L_strict_f"][:, s:, :] if s > 0 else saved["L_strict_f"]).contiguous()
 
-    # 1. d_v_beta[s:] = W_eff[s:, s:]^T @ dO[s:]
-    dO_for_v = dO_h.permute(0, 2, 1, 3).reshape(H_v, Tv, K_sub * D)
-    d_vb_v = torch.bmm(W_vv_b.transpose(1, 2), dO_for_v).view(H_v, Tv, K_sub, D).permute(0, 2, 1, 3).contiguous()
-    del dO_for_v
+    # 1. d_v_beta[s:] = W_eff[s:, s:]^T @ dO[s:] -> [H_v, Tv, K_sub, D] (ZERO copy before or after!)
+    d_vb_htkd = torch.bmm(W_vv_b.transpose(1, 2), dO_htkd.view(H_v, Tv, K_sub * D)).view(H_v, Tv, K_sub, D)
 
-    # 2. Branch A: dA = dO @ U^T -> dQ, dK_A, and A-contribution to d_cum_g
+    use_fused = (
+        use_triton
+        and _HAS_TRITON
+        and do.is_cuda
+        and dtype == torch.bfloat16
+        and T <= 256
+        and D <= 512
+    )
+
+    if use_fused:
+        block_j = triton.next_power_of_2(T)
+        block_d = triton.next_power_of_2(D)
+        d_cum_v = torch.empty((H_v, K_sub, Tv), device=do.device, dtype=torch.float32)
+        dS_vv_T = torch.empty((H_v, K_sub, Tv, Tv), device=do.device, dtype=torch.bfloat16)
+
+        # 2. Branch A: dA -> in-place dS_A + transposed dS_A_vv_T + FP32 d_cum_v in 1 Triton launch!
+        dA_htkt = torch.bmm(dO_htkd.view(H_v, Tv * K_sub, D), U_b.transpose(1, 2)).view(H_v, Tv, K_sub, T)
+        del dO_htkd
+        _wy_gdn_dA_dL_fuse_kernel[(H_v, K_sub)](
+            dA_htkt,
+            A_va_f,
+            p_lo_v,
+            dS_vv_T,
+            d_cum_v,
+            Tv,
+            T,
+            s,
+            dA_htkt.stride(0),
+            dA_htkt.stride(1),
+            dA_htkt.stride(2),
+            A_va_f.stride(0),
+            A_va_f.stride(1),
+            p_lo_v.stride(0),
+            p_lo_v.stride(1),
+            dS_vv_T.stride(0),
+            dS_vv_T.stride(1),
+            dS_vv_T.stride(2),
+            d_cum_v.stride(0),
+            d_cum_v.stride(1),
+            BLOCK_I=16,
+            BLOCK_J=block_j,
+            NEGATE=False,
+            ADD_CUM=False,
+            num_warps=4,
+        )
+        dQ_htkd = torch.bmm(dA_htkt.view(H_v, Tv * K_sub, T), kf_b).view(H_v, Tv, K_sub, D)
+        del dA_htkt
+        dK_hktd = torch.bmm(dS_vv_T.view(H_v, K_sub * Tv, Tv), qf_v_b).view(H_v, K_sub, Tv, D)
+
+        # 3. Branch L (fused negation, reuses dS_vv_T buffer!): dL -> in-place dS_L + dS_L_vv_T + d_cum_v
+        dL_htkt = torch.bmm(d_vb_htkd.view(H_v, Tv * K_sub, D), U_b.transpose(1, 2)).view(H_v, Tv, K_sub, T)
+        _wy_gdn_dA_dL_fuse_kernel[(H_v, K_sub)](
+            dL_htkt,
+            L_va_f,
+            p_st_v,
+            dS_vv_T,
+            d_cum_v,
+            Tv,
+            T,
+            s,
+            dL_htkt.stride(0),
+            dL_htkt.stride(1),
+            dL_htkt.stride(2),
+            L_va_f.stride(0),
+            L_va_f.stride(1),
+            p_st_v.stride(0),
+            p_st_v.stride(1),
+            dS_vv_T.stride(0),
+            dS_vv_T.stride(1),
+            dS_vv_T.stride(2),
+            d_cum_v.stride(0),
+            d_cum_v.stride(1),
+            BLOCK_I=16,
+            BLOCK_J=block_j,
+            NEGATE=True,
+            ADD_CUM=True,
+            num_warps=4,
+        )
+        d_kb_htkd = torch.bmm(dL_htkt.view(H_v, Tv * K_sub, T), kf_b).view(H_v, Tv, K_sub, D)
+        del dL_htkt
+        dK_hktd.add_(torch.bmm(dS_vv_T.view(H_v, K_sub * Tv, Tv), kb_v_b).view(H_v, K_sub, Tv, D))
+        del dS_vv_T
+
+        # 4. Fused dV & d_beta directly into [K_sub, Tv, H_v, D] and [K_sub, Tv, H_v]
+        dV_out = torch.empty((K_sub, Tv, H_v, D), device=do.device, dtype=torch.bfloat16)
+        d_beta_out = torch.empty((K_sub, Tv, H_v), device=do.device, dtype=torch.bfloat16)
+        _wy_gdn_post_v_beta_kernel[(K_sub, Tv, H_v)](
+            d_vb_htkd,
+            d_kb_htkd,
+            vf_v_b,
+            kf_v_b,
+            bf_v_b,
+            dV_out,
+            d_beta_out,
+            D,
+            d_vb_htkd.stride(0),
+            d_vb_htkd.stride(1),
+            d_vb_htkd.stride(2),
+            vf_v_b.stride(0),
+            vf_v_b.stride(1),
+            bf_v_b.stride(0),
+            dV_out.stride(0),
+            dV_out.stride(1),
+            dV_out.stride(2),
+            d_beta_out.stride(0),
+            d_beta_out.stride(1),
+            BLOCK_D=block_d,
+            num_warps=2 if block_d <= 128 else 4,
+        )
+        del d_vb_htkd
+
+        # 5. Fused GVA head reduction + dK += d_kb*beta + scale + L2Norm VJP -> [K_sub, Tv, H_k, D]
+        q_n_s = (saved["q_n"][0, s:] if s > 0 else saved["q_n"][0]).contiguous()
+        q_rstd_s = (saved["q_rstd"][0, s:, :, 0] if s > 0 else saved["q_rstd"][0, :, :, 0]).contiguous()
+        k_n_s = (saved["k_n"][0, s:] if s > 0 else saved["k_n"][0]).contiguous()
+        k_rstd_s = (saved["k_rstd"][0, s:, :, 0] if s > 0 else saved["k_rstd"][0, :, :, 0]).contiguous()
+
+        dQ_raw = torch.empty((K_sub, Tv, H_k, D), device=do.device, dtype=torch.bfloat16)
+        _wy_gdn_reduce_l2norm_kernel[(K_sub, Tv, H_k)](
+            dQ_htkd,
+            dQ_htkd,
+            bf_v_b,
+            q_n_s,
+            q_rstd_s,
+            dQ_raw,
+            D,
+            float(saved["scale"]),
+            dQ_htkd.stride(0),
+            dQ_htkd.stride(2),
+            dQ_htkd.stride(1),
+            0,
+            0,
+            0,
+            bf_v_b.stride(0),
+            q_n_s.stride(0),
+            q_n_s.stride(1),
+            q_rstd_s.stride(0),
+            dQ_raw.stride(0),
+            dQ_raw.stride(1),
+            dQ_raw.stride(2),
+            BLOCK_D=block_d,
+            REP=rep,
+            HAS_KB=False,
+            num_warps=2 if block_d <= 128 else 4,
+        )
+        del dQ_htkd
+
+        dK_raw = torch.empty((K_sub, Tv, H_k, D), device=do.device, dtype=torch.bfloat16)
+        _wy_gdn_reduce_l2norm_kernel[(K_sub, Tv, H_k)](
+            dK_hktd,
+            d_kb_htkd,
+            bf_v_b,
+            k_n_s,
+            k_rstd_s,
+            dK_raw,
+            D,
+            1.0,
+            dK_hktd.stride(0),
+            dK_hktd.stride(1),
+            dK_hktd.stride(2),
+            d_kb_htkd.stride(0),
+            d_kb_htkd.stride(2),
+            d_kb_htkd.stride(1),
+            bf_v_b.stride(0),
+            k_n_s.stride(0),
+            k_n_s.stride(1),
+            k_rstd_s.stride(0),
+            dK_raw.stride(0),
+            dK_raw.stride(1),
+            dK_raw.stride(2),
+            BLOCK_D=block_d,
+            REP=rep,
+            HAS_KB=True,
+            num_warps=2 if block_d <= 128 else 4,
+        )
+        del dK_hktd, d_kb_htkd
+
+        d_g_out = d_cum_v.flip(-1).cumsum(dim=-1).flip(-1).permute(1, 2, 0).contiguous()
+        del d_cum_v
+        return dQ_raw, dK_raw, dV_out, d_g_out, d_beta_out
+
+    # Universal PyTorch exact path (CPU tests & fp32 verification)
+    dO_h = dO_htkd.transpose(1, 2).contiguous()  # [H_v, K_sub, Tv, D]
+    del dO_htkd
+    d_vb_v = d_vb_htkd.transpose(1, 2).contiguous()
+    del d_vb_htkd
+
+    p_lo_b = p_lo_v.unsqueeze(1)
+    p_st_b = p_st_v.unsqueeze(1)
+    A_va_b = A_va_f.unsqueeze(1)
+    L_va_b = L_va_f.unsqueeze(1)
+
     dA_va = torch.bmm(dO_h.view(H_v, K_sub * Tv, D), U_b.transpose(1, 2)).view(H_v, K_sub, Tv, T)
     del dO_h
-    d_lp_a = dA_va.float() * A_va_f
-    d_cum_v = d_lp_a.sum(dim=-1) - d_lp_a[:, :, :, s:].sum(dim=-2)  # [H_v, K_sub, Tv] fp32
+    d_lp_a = dA_va.float() * A_va_b
+    d_cum_v = d_lp_a.sum(dim=-1) - d_lp_a[:, :, :, s:].sum(dim=-2)
     del d_lp_a
     dS_A = dA_va * p_lo_b
     del dA_va
@@ -1294,9 +1820,8 @@ def wy_gdn_bwd_batched(
     ).view(H_v, K_sub, Tv, D)
     del dS_A
 
-    # 3. Branch L: dL = -(d_v_beta @ U^T) -> d_k_beta, dK_L, and L-contribution to d_cum_g
     dL_va = torch.bmm(d_vb_v.view(H_v, K_sub * Tv, D), U_b.transpose(1, 2)).view(H_v, K_sub, Tv, T).neg_()
-    d_lp_l = dL_va.float() * L_va_f
+    d_lp_l = dL_va.float() * L_va_b
     d_cum_v.add_(d_lp_l.sum(dim=-1)).sub_(d_lp_l[:, :, :, s:].sum(dim=-2))
     del d_lp_l
     dS_L = dL_va * p_st_b
@@ -1309,8 +1834,7 @@ def wy_gdn_bwd_batched(
     )
     del dS_L
 
-    # 4. dV, d_beta, dK += d_k_beta * beta, dQ *= scale, d_g = reverse_cumsum(d_cum_v)
-    b_v = (saved["bf_b"][:, s:] if s > 0 else saved["bf_b"]).unsqueeze(1).unsqueeze(-1)
+    b_v = bf_v_b.unsqueeze(1).unsqueeze(-1)
     dV_v = d_vb_v * b_v
     d_beta_v = (d_vb_v * vf_v_b.unsqueeze(1)).sum(dim=-1, dtype=torch.float32)
     del d_vb_v
@@ -1321,7 +1845,6 @@ def wy_gdn_bwd_batched(
     d_g_v = d_cum_v.flip(-1).cumsum(dim=-1).flip(-1)
     del d_cum_v
 
-    # 5. Reduce GVA heads H_v -> H_k and apply fused L2Norm VJP
     dQ_k = dQ_v.view(H_k, rep, K_sub, Tv, D).sum(dim=1).permute(1, 2, 0, 3)
     del dQ_v
     dK_k = dK_v.view(H_k, rep, K_sub, Tv, D).sum(dim=1).permute(1, 2, 0, 3)
@@ -1661,18 +2184,21 @@ class GatedDeltaRuleBackend:
     def backward_batched(
         self,
         saved: dict[str, Any],
-        do: torch.Tensor,  # [K_sub, T_v, H_v, D]
+        do: torch.Tensor,  # [K_sub, T_v, H_v, D] (or [H_v, T_v, K_sub, D] if do_is_htkd=True)
         *,
         bwd_start: int = 0,
+        do_is_htkd: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute `(dq, dk, dv, dg, dbeta)` on suffix `[bwd_start:]` for `K_sub` cotangents at once."""
-        K_sub = do.shape[0]
         mode = saved["mode"]
         s = int(bwd_start)
 
         if mode == "l2_cached_wy":
-            return wy_gdn_bwd_batched(saved, do, bwd_start=s)
+            return wy_gdn_bwd_batched(saved, do, bwd_start=s, do_is_htkd=do_is_htkd)
 
+        if do_is_htkd:
+            do = do.permute(2, 1, 0, 3).contiguous()
+        K_sub = do.shape[0]
         do_full = F.pad(do, (0, 0, 0, 0, s, 0)) if s > 0 else do
 
         def _trim(res_tuple: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1818,6 +2344,8 @@ def causal_conv1d_silu_bwd_qkv_ktc(
     pre_silu: torch.Tensor,  # [1, C, T_v]
     weight: torch.Tensor,    # [C, K_conv]
     *,
+    d_silu_tc: torch.Tensor | None = None,  # Optional precomputed [T_v, C] C-contiguous silu'(pre_silu)^T
+    w_tc: torch.Tensor | None = None,       # Optional precomputed [4, C] C-contiguous weight^T
     use_triton: bool = True,
 ) -> torch.Tensor:
     """Fused `[dq, dk, dv]` + SiLU + 4-tap causal depthwise conv1d VJP directly in `[K_sub, T_v, C]`."""
@@ -1838,33 +2366,44 @@ def causal_conv1d_silu_bwd_qkv_ktc(
         and weight.dtype == torch.bfloat16
         and K_conv == 4
     ):
+        if d_silu_tc is None:
+            u = pre_silu[0].float()
+            sig = torch.sigmoid(u)
+            ds_tc = (sig * (1.0 + u * (1.0 - sig))).to(torch.bfloat16).transpose(0, 1).contiguous()
+        else:
+            ds_tc = d_silu_tc if d_silu_tc.stride(1) == 1 else d_silu_tc.contiguous()
+        if w_tc is None:
+            wtc = weight.transpose(0, 1).contiguous()
+        else:
+            wtc = w_tc if w_tc.stride(1) == 1 else w_tc.contiguous()
+
         out = torch.empty((K_sub, T_v, C), device=dq_f.device, dtype=torch.bfloat16)
-        pre_2d = pre_silu[0]  # [C, T_v]
+        block_k = 8
         block_c = 128
         for src, c_lo, c_len in (
             (dq_f.contiguous(), 0, key_dim),
             (dk_f.contiguous(), key_dim, key_dim),
             (dv_f.contiguous(), 2 * key_dim, val_dim),
         ):
-            pre_s = pre_2d[c_lo : c_lo + c_len]
-            w_s = weight[c_lo : c_lo + c_len]
+            ds_s = ds_tc[:, c_lo : c_lo + c_len]
+            w_s = wtc[:, c_lo : c_lo + c_len]
             out_s = out[:, :, c_lo : c_lo + c_len]
-            grid = (K_sub, T_v, triton.cdiv(c_len, block_c))
-            _causal_conv1d_silu_bwd_slice_kernel[grid](
+            grid = (triton.cdiv(K_sub, block_k), T_v, triton.cdiv(c_len, block_c))
+            _causal_conv1d_silu_bwd_tc_kernel[grid](
                 src,
-                pre_s,
+                ds_s,
                 w_s,
                 out_s,
+                K_sub,
                 T_v,
                 c_len,
                 src.stride(0),
                 src.stride(1),
-                pre_s.stride(0),
-                pre_s.stride(1),
+                ds_s.stride(0),
                 w_s.stride(0),
-                w_s.stride(1),
                 out_s.stride(0),
                 out_s.stride(1),
+                BLOCK_K=block_k,
                 BLOCK_C=block_c,
                 num_warps=4,
             )
@@ -1981,6 +2520,8 @@ def verify_cuda_triton_kernels(
     dx_ref, dg_ref = rmsnorm_gated_vjp_fused(dy_rg, saved_rg, use_triton=False)
     _chk("rmsnorm_gated_dx", dx_tri, dx_ref)
     _chk("rmsnorm_gated_dgate", dg_tri, dg_ref)
+    dx_htkd_tri, _ = rmsnorm_gated_vjp_fused(dy_rg, saved_rg, out_htkd=True, use_triton=use_tri)
+    _chk("rmsnorm_gated_dx_htkd", dx_htkd_tri, dx_ref.permute(2, 1, 0, 3).contiguous())
 
     # 5. HC bwd prep with non-contiguous transposed d_mixed
     dm_parent = torch.randn(T_t, 64, D_t, device=dev, dtype=dt) * 0.3
@@ -2065,7 +2606,18 @@ def verify_cuda_triton_kernels(
         atol=3e-2 if dt == torch.bfloat16 else 1e-4,
     )
 
-    # 11. L2-Cached Exact WY GDN (T=128, bwd_start=16) vs chunked PyTorch autograd
+    # 11. Fused QSA in-place softmax VJP + transposed dS_vv_T
+    scores_q = torch.randn(6, T_full, T_full, device=dev, dtype=torch.float32)
+    scores_q.masked_fill_(torch.ones((T_full, T_full), device=dev, dtype=torch.bool).triu(1), float("-inf"))
+    P_va_q = torch.softmax(scores_q, dim=-1)[:, s_conv:, :].contiguous()
+    dP_tri = torch.randn(6, T_v, 8, T_full, device=dev, dtype=dt) * 0.3
+    dP_ref = dP_tri.clone()
+    dS_T_tri = qsa_softmax_bwd_fused(dP_tri, P_va_q, s_conv, 256 ** -0.5, use_triton=use_tri)
+    dS_T_ref = qsa_softmax_bwd_fused(dP_ref, P_va_q, s_conv, 256 ** -0.5, use_triton=False)
+    _chk("qsa_softmax_dS", dP_tri, dP_ref)
+    _chk("qsa_softmax_dS_T", dS_T_tri, dS_T_ref)
+
+    # 12. L2-Cached Exact WY GDN (T=128, bwd_start=16, fused zero-copy HTKD) vs chunked PyTorch autograd
     q_w = torch.randn(1, T_full, 2, 128, device=dev, dtype=dt) * 0.2
     k_w = torch.randn(1, T_full, 2, 128, device=dev, dtype=dt) * 0.2
     v_w = torch.randn(1, T_full, 6, 128, device=dev, dtype=dt) * 0.2
@@ -2074,7 +2626,10 @@ def verify_cuda_triton_kernels(
     do_full = torch.zeros(4, T_full, 6, 128, device=dev, dtype=dt)
     do_full[:, s_conv:] = torch.randn(4, T_v, 6, 128, device=dev, dtype=dt) * 0.2
     o_wy, saved_wy = wy_gdn_fwd_single(q_w, k_w, v_w, g_w, b_w)
-    dq_wy, dk_wy, dv_wy, dg_wy, db_wy = wy_gdn_bwd_batched(saved_wy, do_full[:, s_conv:], bwd_start=s_conv, use_triton=use_tri)
+    do_htkd = do_full[:, s_conv:].permute(2, 1, 0, 3).contiguous()
+    dq_wy, dk_wy, dv_wy, dg_wy, db_wy = wy_gdn_bwd_batched(
+        saved_wy, do_htkd, bwd_start=s_conv, do_is_htkd=True, use_triton=use_tri
+    )
     with torch.enable_grad():
         q_r = q_w.expand(4, -1, -1, -1).clone().requires_grad_(True)
         k_r = k_w.expand(4, -1, -1, -1).clone().requires_grad_(True)
