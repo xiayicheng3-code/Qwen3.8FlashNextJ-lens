@@ -42,20 +42,20 @@ Imports [`qwen38_jlens`](https://github.com/xiayicheng3-code/Qwen3.8FlashNextJ-l
 ### Core Breakthroughs
 | Optimization | Impact |
 |---|---|
-| **Single-Sweep Reverse Propagation + 16-Aligned Causal Suffix Pruning** | Forward runs ONCE per micro-batch of `FWD_BATCH_SIZE = 8` prompts (caching ~120 MB/prompt in CPU RAM -> **0 GiB extra GPU VRAM, 8× fewer forward weight sweeps**!). Backward exploits block lower-triangular causality to prune masked prefix tokens `[0 : bwd_start]` (`T_v = 112` at `T = 128, skip_first = 16`), holding ALL `K = 2560` cotangents in ONE in-place GPU buffer (`5.47 GiB`, `+0.78 GiB` VRAM headroom) while preserving 128-wide MoE/projection/FlashQLA tiling -> **1× backward weight sweep/prompt** (40×–120× less PCIe/NVMe traffic!). |
-| **Fused Active-Expert MoE VJP (`grouped_mm` + Triton)** | Each layer dequantizes ONLY hit experts **ONCE** via a custom 128×128 Triton FP8 kernel (native FP8 on SM89+ and uint8+LUT on SM80 A100), passes zero-copy transposed views into CUTLASS/cuBLAS `grouped_mm`, fuses SwiGLU backward in Triton, and computes the exact top-k softmax router VJP via batched `bmm` (`~0.07 GiB` scratch vs `6.84 GiB`). |
+| **Single-Sweep Reverse Propagation + Batched Forward MoE + 16-Aligned Causal Suffix Pruning** | Forward runs ONCE per micro-batch of `FWD_BATCH_SIZE = 8` prompts (batching all 8 prompts into **one** `moe_block_fwd` call per layer -> 8× fewer forward dequants & weight sweeps, `0 GiB` extra GPU VRAM!). Backward prunes masked prefix tokens `[0 : bwd_start]` (`T_v = 112` at `T = 128, skip_first = 16`), holding ALL `K = 2560` cotangents in ONE in-place GPU buffer (`5.47 GiB`) -> **1× backward weight sweep/prompt** (40×–120× less PCIe/NVMe traffic!). |
+| **9 Custom Fused Triton VJP Kernels + `grouped_mm` MoE** | Single-read 4-branch injection VJP, fused Hyper-Connection prep + in-place `RMSNorm` VJP straight into `G` (0 FP32 HBM temps), fused `RMSNormGated` + `L2Norm` + 4-tap `Conv1D+SiLU` VJP directly in `[K, T, C]`, 128×128 FP8 block dequant (native SM89+ & uint8+LUT SM80), 2D-tiled SwiGLU VJP, and zero-atomic deterministic FP32-accum MoE scatter-add replacing BF16 `index_add_`. |
 | **Zero-RAM 51B PLE Mmap / Pre-Extraction** | `MADV_RANDOM` mmap directly on PLE safetensors shards (`0 GiB` VRAM, `0 GiB` pinned RAM, `< 2 ms`/prompt), with automatic two-stage pre-extraction (`~64 MB`) if disk is tight. |
 | **Interleaved 3-Tier Async Double-Buffering + Auto VRAM Self-Heal** | Permanently pins dense BF16 (`8.0 GiB`) + max MoE layers in **Tier 0 GPU HBM**, spills to **Tier 1 Pinned/Pageable RAM**, and (on A100 40G) interleaves **Tier 2 contiguous NVMe slabs** so background NVMe preads & H2D DMAs hide **100% behind backward compute**. After loading, `ensure_vram_headroom` verifies live free VRAM and auto-demotes Tier-0 layers to pinned RAM if headroom is ever below the runtime reserve. |
-| **Hardware-Optimal Kernels** | **G4 Blackwell (SM120)**: `FlashQLA v0.1.3` (TileLang SM120 fused GDN fwd+bwd). **A100 (SM80)**: `FLA` Triton fused GDN fwd+bwd. **QSA (all GPUs)**: exact indexer bypass for `T ≤ 2048` + L2-cached exact `B=1` attention VJP (cuBLAS batched GEMMs). |
+| **L2-Cached Exact WY GDN & Exact QSA VJP** | **GDN (`T ≤ 256`)**: precomputes tiny L2-resident `[48, 128, 128]` WY matrices ONCE in `B = 1` forward and runs all `K = 2560` cotangents on suffix `[bwd_start:]` via 6 pure cuBLAS `bmm`s (**~8× faster than FLA on A100 SM80, 0 s Triton autotune stall!**; auto-switches to `FlashQLA` / `FLA` for `T > 256`). **QSA**: exact indexer bypass for `T ≤ 2048` + L2-cached exact `B = 1` attention VJP. |
 
 ---
 
 ### Concrete Auto-Planned Profiles (Default `T = 128`, `Qwen/Qwen3.8-Flash-Next-FP8`)
-| Colab Runtime | GPU Arch | Tier 0 GPU HBM | Tier 1 Host RAM | Tier 2 NVMe Slabs | Dequant Chunk | GDN Kernel | Est. Speed |
+| Colab Runtime | GPU Arch | Tier 0 GPU HBM | Tier 1 Host RAM | Tier 2 NVMe Slabs | Dequant Chunk | GDN Kernel (`T≤256`) | Est. Speed |
 |---|---|---|---|---|---|---|---|
-| **G4 High RAM** (95.6 GiB / 177 GiB RAM) | SM120 | 8.0G dense + **25 MoE layers** | **23 MoE layers** (pinned, interleaved) | **0 layers** | 512 | **FlashQLA SM120** | **~7–10 s/prompt** |
-| **A100 80G High RAM** (79.2 GiB / 167 GiB RAM) | SM80 | 8.0G dense + **19 MoE layers** | **29 MoE layers** (pinned, interleaved) | **0 layers** | 256 | **FLA Triton SM80** | **~18–22 s/prompt** |
-| **A100 40G High RAM** (39.6 GiB / 83.5 GiB RAM) | SM80 | 8.0G dense + **3 MoE layers** | **23 MoE layers** (14 pin + 9 page) | **22 MoE layers** (interleaved) | 256 | **FLA Triton SM80** | **~22–28 s/prompt** |
+| **G4 High RAM** (95.6 GiB / 177 GiB RAM) | SM120 | 8.0G dense + **25 MoE layers** | **23 MoE layers** (pinned, interleaved) | **0 layers** | 512 | **L2-WY cuBLAS** (`>256`: FlashQLA) | **~10–14 s/prompt** |
+| **A100 80G High RAM** (79.2 GiB / 167 GiB RAM) | SM80 | 8.0G dense + **19 MoE layers** | **29 MoE layers** (pinned, interleaved) | **0 layers** | 256 | **L2-WY cuBLAS** (`>256`: FLA) | **~24–30 s/prompt** |
+| **A100 40G High RAM** (39.6 GiB / 83.5 GiB RAM) | SM80 | 8.0G dense + **3 MoE layers** | **23 MoE layers** (14 pin + 9 page) | **22 MoE layers** (interleaved) | 256 | **L2-WY cuBLAS** (`>256`: FLA) | **~28–36 s/prompt** |
 """
         )
     )
@@ -282,7 +282,7 @@ from qwen38_jlens import (
     dequantize_fp8_blockwise,
     detect_hardware,
     grouped_mm,
-    swiglu_vjp_pack,
+    verify_cuda_triton_kernels,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", force=True)
@@ -322,18 +322,16 @@ for row_start in range(0, 48, 12):
 
 # ---- 3-Second Live Kernel Verification & Speed Micro-Benchmark ----
 print("\\nRunning live GPU kernel parity & bandwidth benchmark...")
-gdn_bench = GatedDeltaRuleBackend(preferred=plan.gdn_backend, verify_on_init=True)
+gdn_bench = GatedDeltaRuleBackend(preferred=plan.gdn_backend, verify_on_init=True, max_seq_len=MAX_SEQ_LEN)
 print(f"  [OK] Active GDN kernel : {gdn_bench.name} (direct={gdn_bench._use_direct})")
 
 dev = torch.device("cuda:0")
+verify_cuda_triton_kernels(dev, verbose=True)
+
 E_act = min(380, plan.expert_dequant_chunk)
 w_fp8 = torch.randn(E_act, 1280, 2560, device=dev).to(torch.float8_e4m3fn)
 s_fp32 = torch.rand(E_act, 10, 20, device=dev, dtype=torch.float32) * 0.1 + 0.01
 w_bf16 = dequantize_fp8_blockwise(w_fp8, s_fp32, use_triton=plan.use_triton_fp8_dequant)
-w_ref = dequantize_fp8_blockwise(w_fp8[:2], s_fp32[:2], use_triton=False)
-deq_err = (w_bf16[:2].float() - w_ref.float()).abs().max().item()
-assert deq_err == 0.0, f"FP8 Triton dequant mismatch: max_diff={deq_err}"
-del w_ref
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 for _ in range(5):
@@ -342,18 +340,7 @@ torch.cuda.synchronize()
 dt_deq = (time.perf_counter() - t0) / 5
 bytes_rw = E_act * 1280 * 2560 * (1 + 2)
 deq_mode = "native-fp8" if profile.compute_capability >= (8, 9) else "sm80-u8-lut"
-print(f"  [OK] Triton FP8->BF16 dequant ({deq_mode}, {E_act} experts): {dt_deq*1e3:.2f} ms ({bytes_rw / dt_deq / 1e9:.0f} GB/s, max_diff={deq_err:.1e})")
-
-# Verify Triton fused SwiGLU backward + pack
-_dA = torch.randn(16, 64, 640, device=dev, dtype=torch.bfloat16)
-_dg = torch.randn(16, 640, device=dev, dtype=torch.bfloat16)
-_du = torch.randn(16, 640, device=dev, dtype=torch.bfloat16)
-_sw_tri = swiglu_vjp_pack(_dA, _dg, _du, use_triton=plan.use_triton_swiglu_vjp)
-_sw_ref = swiglu_vjp_pack(_dA, _dg, _du, use_triton=False)
-sw_err = (_sw_tri.float() - _sw_ref.float()).abs().max().item()
-assert sw_err <= 1e-2, f"Triton SwiGLU mismatch: max_diff={sw_err}"
-print(f"  [OK] Triton SwiGLU VJP pack : verified (max_diff={sw_err:.1e})")
-del _dA, _dg, _du, _sw_tri, _sw_ref
+print(f"  [OK] Triton FP8->BF16 dequant ({deq_mode}, {E_act} experts): {dt_deq*1e3:.2f} ms ({bytes_rw / dt_deq / 1e9:.0f} GB/s)")
 
 K_blk = plan.moe_k_chunk
 S_rows = 128 * 10

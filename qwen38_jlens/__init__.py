@@ -19,7 +19,13 @@ from qwen38_jlens.engine import (
     valid_position_mask,
 )
 from qwen38_jlens.hardware import HardwareProfile, OffloadPlan, StorageTier, build_offload_plan, detect_hardware
-from qwen38_jlens.kernels import GatedDeltaRuleBackend, dequantize_fp8_blockwise, grouped_mm, swiglu_vjp_pack
+from qwen38_jlens.kernels import (
+    GatedDeltaRuleBackend,
+    dequantize_fp8_blockwise,
+    grouped_mm,
+    swiglu_vjp_pack,
+    verify_cuda_triton_kernels,
+)
 from qwen38_jlens.lens import Qwen38JacobianLens, render_slice_html
 from qwen38_jlens.loader import LoadedQwen38Model, Qwen38TextConfig, load_qwen38_streaming
 from qwen38_jlens.ple_mmap import InMemoryPleProvider, MmapPleTable, PleHashSpec, PreextractedPleProvider
@@ -57,4 +63,5 @@ __all__ = [
     "save_jlens_safetensors",
     "swiglu_vjp_pack",
     "valid_position_mask",
+    "verify_cuda_triton_kernels",
 ]

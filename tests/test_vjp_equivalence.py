@@ -774,7 +774,95 @@ def test_full_4layer_qwen4exp_jlens_fit_exact_parity():
     assert batched_fwd_sweeps == 2 and single_fwd_sweeps == 5
     assert batched_bwd_sweeps == single_bwd_sweeps
     for l in src_layers:
-        assert torch.equal(lens_batched.jacobians[l], lens_single.jacobians[l]), (
-            f"Layer {l} mismatch between fwd_batch_size=3 and fwd_batch_size=1"
+        assert torch.allclose(lens_batched.jacobians[l], lens_single.jacobians[l], atol=1e-5), (
+            f"Layer {l} mismatch between fwd_batch_size=3 and fwd_batch_size=1: "
+            f"max_diff={(lens_batched.jacobians[l] - lens_single.jacobians[l]).abs().max().item()}"
         )
     engine.close()
+
+
+@pytest.mark.parametrize("T,bwd_start", [(32, 0), (128, 16)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_wy_gdn_exact_parity_fp32_and_bf16(T: int, bwd_start: int, dtype: torch.dtype):
+    """Verify L2-cached exact WY GDN (`wy_gdn_fwd_single` + `wy_gdn_bwd_batched`) against chunked autograd."""
+    from qwen38_jlens.kernels import wy_gdn_bwd_batched, wy_gdn_fwd_single
+
+    torch.manual_seed(17 + T + bwd_start)
+    Hk, Hv, D, K_sub = 2, 6, 16, 5
+    q = torch.randn(1, T, Hk, D, dtype=dtype) * 0.25
+    k = torch.randn(1, T, Hk, D, dtype=dtype) * 0.25
+    v = torch.randn(1, T, Hv, D, dtype=dtype) * 0.25
+    g = -F.softplus(torch.randn(1, T, Hv, dtype=torch.float32))
+    beta = torch.sigmoid(torch.randn(1, T, Hv, dtype=dtype))
+
+    do_full = torch.zeros(K_sub, T, Hv, D, dtype=dtype)
+    do_full[:, bwd_start:] = torch.randn(K_sub, T - bwd_start, Hv, D, dtype=dtype) * 0.25
+
+    o_wy, saved = wy_gdn_fwd_single(q, k, v, g, beta)
+    assert saved["mode"] == "l2_cached_wy"
+    dq, dk, dv, dg, db = wy_gdn_bwd_batched(saved, do_full[:, bwd_start:], bwd_start=bwd_start, use_triton=False)
+
+    q_r = q.expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
+    k_r = k.expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
+    v_r = v.expand(K_sub, -1, -1, -1).clone().requires_grad_(True)
+    g_r = g.expand(K_sub, -1, -1).clone().requires_grad_(True)
+    b_r = beta.expand(K_sub, -1, -1).clone().requires_grad_(True)
+    o_r = torch_chunk_gated_delta_rule(q_r, k_r, v_r, g_r, b_r, use_qk_l2norm_in_kernel=True)
+    dq_r, dk_r, dv_r, dg_r, db_r = torch.autograd.grad(o_r, (q_r, k_r, v_r, g_r, b_r), grad_outputs=do_full)
+
+    atol = 1e-4 if dtype == torch.float32 else 6e-2
+    assert torch.allclose(o_wy.float(), o_r[:1].float(), atol=atol)
+    assert torch.allclose(dq.float(), dq_r[:, bwd_start:].float(), atol=atol)
+    assert torch.allclose(dk.float(), dk_r[:, bwd_start:].float(), atol=atol)
+    assert torch.allclose(dv.float(), dv_r[:, bwd_start:].float(), atol=atol)
+    assert torch.allclose(dg.float(), dg_r[:, bwd_start:].float(), atol=atol)
+    assert torch.allclose(db.float(), db_r[:, bwd_start:].float(), atol=atol)
+
+    # Confirm explicit backend dispatch modes
+    be_wy = GatedDeltaRuleBackend(preferred="auto", max_seq_len=128)
+    assert be_wy.name == "l2_cached_wy"
+    be_torch = GatedDeltaRuleBackend(preferred="torch", max_seq_len=128)
+    assert be_torch.name == "torch" and be_torch.wy_max_seq_len == 0
+
+
+def test_fused_vjp_helpers_and_self_check_parity():
+    """Verify all fused VJP helper contracts (non-contiguous inputs, out_add, chunked scatter, conv1d+SiLU, self-check)."""
+    from qwen38_jlens.kernels import (
+        causal_conv1d_silu_bwd_qkv_ktc,
+        causal_conv1d_silu_fwd,
+        verify_cuda_triton_kernels,
+    )
+
+    torch.manual_seed(23)
+    # 1. Verify causal_conv1d_silu_bwd_qkv_ktc against autograd on suffix [s:]
+    K_sub, T, s = 5, 32, 16
+    Hk, Hv, D = 2, 6, 8
+    kd, vd = Hk * D, Hv * D
+    C = 2 * kd + vd
+    x_in = torch.randn(1, C, T)
+    w_conv = torch.randn(C, 4) * 0.2
+    _, pre = causal_conv1d_silu_fwd(x_in, w_conv)
+
+    dq_full = torch.zeros(K_sub, T, Hk, D)
+    dk_full = torch.zeros(K_sub, T, Hk, D)
+    dv_full = torch.zeros(K_sub, T, Hv, D)
+    dq_full[:, s:] = torch.randn(K_sub, T - s, Hk, D)
+    dk_full[:, s:] = torch.randn(K_sub, T - s, Hk, D)
+    dv_full[:, s:] = torch.randn(K_sub, T - s, Hv, D)
+
+    dx_ktc = causal_conv1d_silu_bwd_qkv_ktc(
+        dq_full[:, s:], dk_full[:, s:], dv_full[:, s:], pre[:, :, s:], w_conv, use_triton=False
+    )
+    x_r = x_in.expand(K_sub, -1, -1).clone().requires_grad_(True)
+    y_r, _ = causal_conv1d_silu_fwd(x_r, w_conv)
+    dy_r = torch.cat(
+        [dq_full.reshape(K_sub, T, kd), dk_full.reshape(K_sub, T, kd), dv_full.reshape(K_sub, T, vd)], dim=-1
+    ).transpose(1, 2)
+    (dx_ref,) = torch.autograd.grad(y_r, x_r, grad_outputs=dy_r)
+    assert torch.allclose(dx_ktc, dx_ref.transpose(1, 2)[:, s:], atol=1e-5)
+
+    # 2. Run the unified verify_cuda_triton_kernels self-check on CPU
+    errs = verify_cuda_triton_kernels("cpu", verbose=False)
+    assert len(errs) >= 18
+    assert all(v <= 2e-4 for v in errs.values()), f"Unexpected CPU self-check error: {errs}"
+

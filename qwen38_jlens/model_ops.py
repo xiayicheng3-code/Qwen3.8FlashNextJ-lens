@@ -26,10 +26,16 @@ import torch.nn.functional as F
 
 from qwen38_jlens.kernels import (
     GatedDeltaRuleBackend,
-    causal_conv1d_silu_bwd,
+    causal_conv1d_silu_bwd_qkv_ktc,
     causal_conv1d_silu_fwd,
     dequantize_fp8_blockwise,
     grouped_mm,
+    hc_bwd_prep_fused,
+    hc_inject_vjp_fused,
+    moe_gather_scale_fused,
+    moe_scatter_add_tk_fused,
+    rmsnorm_gated_vjp_fused,
+    rmsnorm_vjp_fused,
     swiglu_vjp_pack,
 )
 
@@ -168,24 +174,14 @@ def rmsnorm_vjp(
     rstd: torch.Tensor,    # [1, ..., (G,) 1]  float32
     weight: torch.Tensor,  # [D]
     group_size: int | None = None,
+    *,
+    out_add: torch.Tensor | None = None,
+    use_triton: bool = True,
 ) -> torch.Tensor:
-    """Exact batched-cotangent VJP of Qwen4ExpTextRMSNorm (low-VRAM in-place fp32 math)."""
-    orig_dy_shape = dy.shape
-    g = dy.to(torch.float32, copy=True)
-    wf = 1.0 + weight.float()
-    if group_size is not None:
-        g = g.reshape(*orig_dy_shape[:-1], -1, group_size)
-        wf = wf.reshape(-1, group_size)
-    g.mul_(wf)
-    dot = (g * x_hat).mean(dim=-1, keepdim=True)
-    g.addcmul_(x_hat, dot, value=-1.0)
-    del dot
-    g.mul_(rstd)
-    dx = g.to(dy.dtype)
-    del g
-    if group_size is not None:
-        dx = dx.reshape(orig_dy_shape)
-    return dx
+    """Exact batched-cotangent VJP of Qwen4ExpTextRMSNorm (fused Triton on CUDA BF16, in-place fallback)."""
+    return rmsnorm_vjp_fused(
+        dy, x_hat, rstd, weight, group_size=group_size, out_add=out_add, use_triton=use_triton
+    )
 
 
 def rmsnorm_gated_fwd(
@@ -225,19 +221,11 @@ def rmsnorm_gated_fwd(
 def rmsnorm_gated_vjp(
     dy: torch.Tensor,  # [K, T, H_v, D_v]
     saved: dict[str, torch.Tensor],
+    *,
+    use_triton: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact VJP of Qwen4ExpTextRMSNormGated -> `(dx, dgate)` (low-VRAM in-place fp32 math)."""
-    dyf = dy.to(torch.float32, copy=True)
-    d_gate = (dyf * saved["normed"] * saved["d_act_g"]).to(dy.dtype)
-    dyf.mul_(saved["act_g"]).mul_(saved["weight_f"])
-    x_hat_f = saved["x_hat_f"]
-    dot = (dyf * x_hat_f).mean(dim=-1, keepdim=True)
-    dyf.addcmul_(x_hat_f, dot, value=-1.0)
-    del dot
-    dyf.mul_(saved["rstd"])
-    dx = dyf.to(dy.dtype)
-    del dyf
-    return dx, d_gate
+    """Exact VJP of Qwen4ExpTextRMSNormGated -> `(dx, dgate)` (single-pass fused Triton on CUDA BF16)."""
+    return rmsnorm_gated_vjp_fused(dy, saved, use_triton=use_triton)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,31 +276,48 @@ def gated_residual_vjp(
     d_inj: torch.Tensor | None,     # [K, T, hc_count] or None
     w: GatedResidualWeights,
     saved: dict[str, Any],
+    *,
+    out_add: torch.Tensor | None = None,
+    use_triton: bool = True,
 ) -> torch.Tensor:
-    """Exact VJP of `Qwen4ExpTextGatedResidual` w.r.t. `hyper_input` -> `[K, T, hc_count * D]`."""
-    inv_hc = 1.0 / w.hc_count
-    d_prod = (d_mixed * inv_hc).unsqueeze(-2)  # [K, T, 1, D]
+    """Exact VJP of `Qwen4ExpTextGatedResidual` w.r.t. `hyper_input` -> `[K, T, hc_count * D]`.
 
-    # Direct branch through h_norm * m
-    d_h_norm = (d_prod * saved["m_4"]).flatten(-2)
+    Fuses branch prep (`d_h_norm`, `d_u2`) in Triton, accumulates `W_down` / `W_inj` directly
+    into `d_h_norm` via `addmm_` (zero extra `[K, T, 10240]` buffers), and fuses `rmsnorm_vjp`
+    directly into `out_add` when provided!
+    """
+    K, T, _ = d_mixed.shape
+    D_hc = w.hc_count * w.hidden_size
+    inv_hc = 1.0 / w.hc_count
+
+    d_h_norm, d_u2 = hc_bwd_prep_fused(
+        d_mixed, saved["m_4"], saved["h_norm_4"], saved["dm_du2"], inv_hc, use_triton=use_triton
+    )
+    d_h_norm_2d = d_h_norm.view(K * T, D_hc)
 
     # Gate branch through m = sigmoid(W_up(silu(W_down(h_norm) / hc)))
-    d_u2 = (d_prod * saved["h_norm_4"] * saved["dm_du2"]).flatten(-2)  # [K, T, hc*D]
-    del d_prod
-    d_s1 = torch.matmul(d_u2, w.input_mix_weight_up)  # [K, T, hc_lowrank]
+    d_s1 = torch.mm(d_u2.view(K * T, D_hc), w.input_mix_weight_up)  # [K*T, hc_lowrank]
     del d_u2
-    d_u1 = d_s1 * saved["d_silu_u1"]
+    d_u1 = (d_s1.view(K, T, -1) * saved["d_silu_u1"]).mul_(inv_hc)
     del d_s1
-    d_h_norm.add_(torch.matmul(d_u1 * inv_hc, w.input_mix_weight_down))
+    d_h_norm_2d.addmm_(d_u1.view(K * T, -1), w.input_mix_weight_down)
     del d_u1
 
     # Injection gate branch
     if d_inj is not None and w.block_inject_weight is not None:
-        d_u3 = d_inj * saved["d_inj_u3"]  # [K, T, hc_count]
-        d_h_norm.add_(torch.matmul(d_u3 * inv_hc, w.block_inject_weight))
+        d_u3 = (d_inj * saved["d_inj_u3"]).mul_(inv_hc)  # [K, T, hc_count]
+        d_h_norm_2d.addmm_(d_u3.reshape(K * T, -1), w.block_inject_weight)
         del d_u3
 
-    return rmsnorm_vjp(d_h_norm, saved["x_hat"], saved["rstd"], w.hc_norm_weight, group_size=w.hidden_size)
+    return rmsnorm_vjp_fused(
+        d_h_norm,
+        saved["x_hat"],
+        saved["rstd"],
+        w.hc_norm_weight,
+        group_size=w.hidden_size,
+        out_add=out_add,
+        use_triton=use_triton,
+    )
 
 
 def slice_gated_residual_saved(saved: dict[str, Any], bwd_start: int) -> dict[str, Any]:
@@ -631,18 +636,18 @@ def qsa_layer_vjp(
     del dQ_normed, dK_normed
 
     # 5. Pack [dQ_raw, d_gate] matching q_proj output layout [K_sub, T_v, H_q, 2*Dh]
-    dQG = torch.cat([dQ_raw, d_gate.view(K_sub, T_v, H_q, Dh)], dim=-1).reshape(K_sub, T_v, H_q * Dh * 2)
-    dK_flat = dK_raw.reshape(K_sub, T_v, H_kv * Dh)
-    dV_flat = dV.transpose(1, 2).reshape(K_sub, T_v, H_kv * Dh)
+    dQG = torch.cat([dQ_raw, d_gate.view(K_sub, T_v, H_q, Dh)], dim=-1).reshape(K_sub * T_v, H_q * Dh * 2)
+    dK_flat = dK_raw.reshape(K_sub * T_v, H_kv * Dh)
+    dV_flat = dV.transpose(1, 2).reshape(K_sub * T_v, H_kv * Dh)
     del dQ_raw, dK_raw, d_gate, dV
 
-    d_x = torch.matmul(dQG, w.q_proj)
+    d_x_2d = torch.mm(dQG, w.q_proj)
     del dQG
-    d_x.add_(torch.matmul(dK_flat, w.k_proj))
+    d_x_2d.addmm_(dK_flat, w.k_proj)
     del dK_flat
-    d_x.add_(torch.matmul(dV_flat, w.v_proj))
+    d_x_2d.addmm_(dV_flat, w.v_proj)
     del dV_flat
-    return d_x
+    return d_x_2d.view(K_sub, T_v, -1)
 
 
 # --------------------------------------------------------------------------- #
@@ -653,7 +658,7 @@ def gdn_layer_fwd(
     w: GdnLayerWeights,
     gdn_backend: GatedDeltaRuleBackend,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Exact GDN forward using FlashQLA (SM90/100/120) or FLA Triton (SM80) or PyTorch."""
+    """Exact GDN forward using L2-cached WY (T<=256), FlashQLA (SM90/100/120), FLA (SM80), or PyTorch."""
     B, T, _ = hidden_states.shape
     key_dim = w.num_k_heads * w.head_k_dim
     val_dim = w.num_v_heads * w.head_v_dim
@@ -701,13 +706,13 @@ def gdn_layer_vjp(
     bwd_start: int = 0,
 ) -> torch.Tensor:
     """Exact batched-cotangent VJP of `Qwen4ExpTextGatedDeltaNet` on suffix `[bwd_start:]` -> `[K_sub, T_v, D]`."""
-    K_sub, T_v, _ = d_out.shape
+    K_sub, T_v, D = d_out.shape
     s = int(bwd_start)
     val_dim = w.num_v_heads * w.head_v_dim
     dtype = d_out.dtype
 
-    # 1. out_proj & RMSNormGated VJP on [s:]
-    d_norm_out = torch.matmul(d_out, w.out_proj).view(K_sub, T_v, w.num_v_heads, w.head_v_dim)
+    # 1. out_proj & fused Triton RMSNormGated VJP on [s:]
+    d_norm_out = torch.mm(d_out.reshape(K_sub * T_v, D), w.out_proj).view(K_sub, T_v, w.num_v_heads, w.head_v_dim)
     if s > 0:
         norm_s = {k: (v[:, s:] if v.ndim == 4 else v) for k, v in saved["norm_saved"].items()}
     else:
@@ -715,17 +720,9 @@ def gdn_layer_vjp(
     d_core_out, d_z = rmsnorm_gated_vjp(d_norm_out, norm_s)
     del d_norm_out
 
-    # 2. Core Gated Delta Rule VJP (zero-pad [0:s] to preserve exact 128-aligned FlashQLA/FLA tiles!)
-    d_core_in = F.pad(d_core_out, (0, 0, 0, 0, s, 0)) if s > 0 else d_core_out
+    # 2. Core Gated Delta Rule VJP (zero-pad skipped for L2-cached WY!)
+    dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(saved["gdn_saved"], d_core_out, bwd_start=s)
     del d_core_out
-    dq, dk, dv, dg, dbeta = gdn_backend.backward_batched(saved["gdn_saved"], d_core_in)
-    del d_core_in
-    if s > 0:
-        dq = dq[:, s:]
-        dk = dk[:, s:]
-        dv = dv[:, s:]
-        dg = dg[:, s:]
-        dbeta = dbeta[:, s:]
 
     # 3. Gate activations VJP on [s:]: beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
     beta_f = (saved["beta"][:, s:] if s > 0 else saved["beta"]).float()
@@ -734,28 +731,21 @@ def gdn_layer_vjp(
     da = (dg.float() * saved["neg_exp_A"] * sig_adt).to(dtype)
     del dbeta, dg
 
-    # 4. Pack [dq, dk, dv] -> causal_conv1d + SiLU VJP on [s:] (causal adjoint only looks at t' >= t >= s!)
-    d_mixed_t = torch.cat(
-        [dq.reshape(K_sub, T_v, -1), dk.reshape(K_sub, T_v, -1), dv.reshape(K_sub, T_v, -1)],
-        dim=-1,
-    )
-    del dq, dk, dv
+    # 4. Fused [dq, dk, dv] + SiLU + 4-tap causal conv1d VJP directly in [K_sub, T_v, conv_dim]!
     pre_silu_s = saved["conv_pre_silu"][:, :, s:] if s > 0 else saved["conv_pre_silu"]
-    d_conv_in = causal_conv1d_silu_bwd(
-        d_mixed_t.transpose(1, 2), pre_silu_s, w.conv1d_weight
-    ).transpose(1, 2)  # [K_sub, T_v, conv_dim]
-    del d_mixed_t
+    d_conv_in = causal_conv1d_silu_bwd_qkv_ktc(dq, dk, dv, pre_silu_s, w.conv1d_weight)
+    del dq, dk, dv
 
-    # 5. Input projections VJP on [s:]
-    d_x = torch.matmul(d_conv_in, w.in_proj_qkv)
+    # 5. Input projections VJP on [s:] via in-place addmm_ (zero intermediate [K_sub, T_v, D] buffers!)
+    d_x_2d = torch.mm(d_conv_in.reshape(K_sub * T_v, -1), w.in_proj_qkv)
     del d_conv_in
-    d_x.add_(torch.matmul(d_z.reshape(K_sub, T_v, val_dim), w.in_proj_z))
+    d_x_2d.addmm_(d_z.reshape(K_sub * T_v, val_dim), w.in_proj_z)
     del d_z
-    d_x.add_(torch.matmul(db, w.in_proj_b))
+    d_x_2d.addmm_(db.reshape(K_sub * T_v, -1), w.in_proj_b)
     del db
-    d_x.add_(torch.matmul(da, w.in_proj_a))
+    d_x_2d.addmm_(da.reshape(K_sub * T_v, -1), w.in_proj_a)
     del da
-    return d_x
+    return d_x_2d.view(K_sub, T_v, D)
 
 
 # --------------------------------------------------------------------------- #
@@ -1068,6 +1058,7 @@ def moe_block_vjp_all(
         sub_du = da_du_sorted[row_lo:row_hi]           # [n_rows, r_inter]
         sub_offs_1 = offs_1[c0:c1] - row_lo            # [c1 - c0] int32
         sub_offs_1_list = [v - row_lo for v in offs_1_list[c0:c1]]
+        inv_perm_2d = inv_perm.view(T, top_k)
 
         # Notice W_dn is [E_c, D, r_inter] and W_gu is [E_c, 2*r_inter, D]:
         # ALREADY in exact contiguous [E_c, K_in, N_out] layout for backward grouped_mm!
@@ -1075,9 +1066,10 @@ def moe_block_vjp_all(
             k1 = min(k0 + moe_k_chunk, K_total)
             K_blk = k1 - k0
 
-            # Gather [n_rows, K_blk, D] and scale by routing weights IN-PLACE (1x 1.37 GiB, not 2x!)
-            dy_s = dY_TK[sub_tok, k0:k1, :]  # advanced indexing -> fresh contiguous copy
-            dy_s.mul_(sub_w[:, None, None])  # [n_rows, K_blk, D]
+            # Fused 1-pass token gather + routing-weight scale -> [n_rows, K_blk, D]
+            dy_s = moe_gather_scale_fused(
+                dY_TK, sub_tok, sub_w, k0, k1, use_triton=use_triton_swiglu
+            )
             offs_K = sub_offs_1 * K_blk
             offs_K_list = [v * K_blk for v in sub_offs_1_list]
 
@@ -1085,7 +1077,7 @@ def moe_block_vjp_all(
             dA = grouped_mm(dy_s.reshape(n_rows * K_blk, D), W_dn, offs_K, offs_K_list).view(n_rows, K_blk, -1)
             del dy_s
 
-            # Fused SwiGLU backward + pack [dG | dU] -> [n_rows * K_blk, 2 * r_inter]
+            # 2D-tiled fused SwiGLU backward + pack [dG | dU] -> [n_rows * K_blk, 2 * r_inter]
             dGU = swiglu_vjp_pack(dA, sub_dg, sub_du, use_triton=use_triton_swiglu).reshape(n_rows * K_blk, -1)
             del dA
 
@@ -1093,12 +1085,17 @@ def moe_block_vjp_all(
             dX_s = grouped_mm(dGU, W_gu, offs_K, offs_K_list).view(n_rows, K_blk, D)
             del dGU
 
-            # Deterministic low-VRAM accumulation back to token axis (0.14 GiB/rank vs 1.37 GiB full gather!)
-            if c0 == 0 and c1 == E_hit:
-                for r in range(top_k):
-                    dX_TK[:, k0:k1, :].add_(dX_s[inv_perm[r::top_k]])
-            else:
-                dX_TK[:, k0:k1, :].index_add_(0, sub_tok, dX_s)
+            # Zero-atomic deterministic FP32-accum scatter-add back to dX_TK[:, k0:k1, :] (7.1s -> ~0.9s!)
+            moe_scatter_add_tk_fused(
+                dX_TK,
+                dX_s,
+                inv_perm_2d,
+                row_lo,
+                k0,
+                k1,
+                sub_tok=sub_tok,
+                use_triton=use_triton_swiglu,
+            )
             del dX_s
 
         if pre_W_gu is None:
@@ -1125,6 +1122,34 @@ def _slice_ple_saved(saved: dict[str, Any], bwd_start: int) -> dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+def decoder_layer_attn_fwd(
+    H_in: torch.Tensor,  # [1, T, hc_count * D]
+    layer_w: DecoderLayerDenseWeights,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    gdn_backend: GatedDeltaRuleBackend,
+    *,
+    ple_embeddings: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Forward-only PLE + Attn HC + GDN/QSA + residual injection -> `H_mid` (used for batched forward MoE)."""
+    if layer_w.ple is not None:
+        assert ple_embeddings is not None, f"Layer {layer_w.layer_idx} requires ple_embeddings."
+        ple_delta, _ = ple_layer_fwd(H_in, ple_embeddings, layer_w.ple)
+        H_ple = H_in + ple_delta
+    else:
+        H_ple = H_in
+
+    x_attn, w_attn, _ = gated_residual_fwd(H_ple, layer_w.attn_hc)
+    assert w_attn is not None
+    if layer_w.layer_type == "linear_attention":
+        assert layer_w.gdn is not None
+        y_attn, _ = gdn_layer_fwd(x_attn, layer_w.gdn, gdn_backend)
+    else:
+        assert layer_w.qsa is not None
+        y_attn, _ = qsa_layer_fwd(x_attn, layer_w.qsa, cos, sin)
+    return H_ple + (y_attn.unsqueeze(-2) * w_attn.unsqueeze(-1)).flatten(-2)
 
 
 def decoder_layer_fwd(
@@ -1237,15 +1262,18 @@ def decoder_layer_vjp_inplace(
     y_mlp = saved["y_mlp"]  # [T_v, D]
     w_mlp = saved["w_mlp"]  # [T_v, hc]
 
-    # Build d_y_mlp_TK directly in [T_v, K_total, D] layout so moe_block_vjp_all needs ZERO transpose copies!
+    # Single-read fused Triton injection VJP directly into [T_v, K_total, D] (0 transpose copies, 0 FP32 temps!)
     d_y_mlp_TK = torch.empty((T_v, K_total, D), device=G.device, dtype=G.dtype)
     d_w_mlp = torch.empty((K_total, T_v, hc), device=G.device, dtype=G.dtype)
-    proj_step = min(64, moe_k_chunk)
-    for k0 in range(0, K_total, proj_step):
-        k1 = min(k0 + proj_step, K_total)
-        g4 = G[k0:k1].view(k1 - k0, T_v, hc, D)
-        d_y_mlp_TK[:, k0:k1, :] = (g4 * w_mlp[None, :, :, None]).sum(dim=2).transpose(0, 1)
-        d_w_mlp[k0:k1] = (g4.float() * y_mlp.float()[None, :, None, :]).sum(dim=-1).to(G.dtype)
+    if use_triton_swiglu and G.is_cuda and hc == 4 and G.dtype == torch.bfloat16:
+        hc_inject_vjp_fused(G, y_mlp, w_mlp, d_y_mlp_TK, d_w_mlp, tk_layout=True, use_triton=True)
+    else:
+        proj_step = min(64, moe_k_chunk)
+        for k0 in range(0, K_total, proj_step):
+            k1 = min(k0 + proj_step, K_total)
+            hc_inject_vjp_fused(
+                G[k0:k1], y_mlp, w_mlp, d_y_mlp_TK[:, k0:k1, :], d_w_mlp[k0:k1], tk_layout=True, use_triton=False
+            )
 
     d_x_mlp_TK = moe_block_vjp_all(
         d_y_mlp_TK,
@@ -1262,29 +1290,32 @@ def decoder_layer_vjp_inplace(
     saved["moe_saved"]["cached_W_gu"] = None
     saved["moe_saved"]["cached_W_dn"] = None
 
-    hc_k_chunk = min(64, moe_k_chunk)
+    # Fused Triton HC VJP + fused in-place RMSNorm VJP straight into G[k0:k1] (0 FP32 temps -> 128-wide safe!)
+    hc_k_chunk = min(128, moe_k_chunk) if (use_triton_swiglu and G.is_cuda) else min(64, moe_k_chunk)
     for k0 in range(0, K_total, hc_k_chunk):
         k1 = min(k0 + hc_k_chunk, K_total)
-        G[k0:k1].add_(
-            gated_residual_vjp(
-                d_x_mlp_TK[:, k0:k1, :].transpose(0, 1),
-                d_w_mlp[k0:k1],
-                layer_w.mlp_hc,
-                saved["mlp_hc_saved"],
-            )
+        gated_residual_vjp(
+            d_x_mlp_TK[:, k0:k1, :].transpose(0, 1),
+            d_w_mlp[k0:k1],
+            layer_w.mlp_hc,
+            saved["mlp_hc_saved"],
+            out_add=G[k0:k1],
+            use_triton=use_triton_swiglu,
         )
     del d_x_mlp_TK, d_w_mlp
 
     # ---- Stage B: Attention Injection + Token Mixer (GDN/QSA) + Attn Hyper-Connection ----
     y_attn = saved["y_attn"]  # [T_v, D]
     w_attn = saved["w_attn"]  # [T_v, hc]
-    attn_hc_step = min(64, attn_k_chunk)
+    attn_hc_step = attn_k_chunk if (use_triton_swiglu and G.is_cuda) else min(64, attn_k_chunk)
     for k0 in range(0, K_total, attn_k_chunk):
         k1 = min(k0 + attn_k_chunk, K_total)
-        g4 = G[k0:k1].view(k1 - k0, T_v, hc, D)
-        d_y_attn = (g4 * w_attn[None, :, :, None]).sum(dim=2)
-        d_w_attn = (g4.float() * y_attn.float()[None, :, None, :]).sum(dim=-1).to(G.dtype)
-        del g4
+        K_sub = k1 - k0
+        d_y_attn = torch.empty((K_sub, T_v, D), device=G.device, dtype=G.dtype)
+        d_w_attn = torch.empty((K_sub, T_v, hc), device=G.device, dtype=G.dtype)
+        hc_inject_vjp_fused(
+            G[k0:k1], y_attn, w_attn, d_y_attn, d_w_attn, tk_layout=False, use_triton=use_triton_swiglu
+        )
 
         if layer_w.layer_type == "linear_attention":
             assert layer_w.gdn is not None
@@ -1298,12 +1329,15 @@ def decoder_layer_vjp_inplace(
             )
         del d_y_attn
 
-        for s0 in range(0, k1 - k0, attn_hc_step):
-            s1 = min(s0 + attn_hc_step, k1 - k0)
-            G[k0 + s0 : k0 + s1].add_(
-                gated_residual_vjp(
-                    d_x_attn[s0:s1], d_w_attn[s0:s1], layer_w.attn_hc, saved["attn_hc_saved"]
-                )
+        for s0 in range(0, K_sub, attn_hc_step):
+            s1 = min(s0 + attn_hc_step, K_sub)
+            gated_residual_vjp(
+                d_x_attn[s0:s1],
+                d_w_attn[s0:s1],
+                layer_w.attn_hc,
+                saved["attn_hc_saved"],
+                out_add=G[k0 + s0 : k0 + s1],
+                use_triton=use_triton_swiglu,
             )
         del d_x_attn, d_w_attn
 

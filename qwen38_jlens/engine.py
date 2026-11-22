@@ -42,10 +42,12 @@ from qwen38_jlens.loader import (
 from qwen38_jlens.model_ops import (
     MoeExpertPayload,
     build_rope_cos_sin,
+    decoder_layer_attn_fwd,
     decoder_layer_fwd,
     decoder_layer_vjp_inplace,
     gated_residual_fwd,
     gated_residual_vjp,
+    moe_block_fwd,
     slice_gated_residual_saved,
 )
 
@@ -236,7 +238,7 @@ class AsyncMoEStreamer:
 
             if t == StorageTier.HOST_PINNED:
                 src_payload = self.model.moe_tier_store[l_idx]
-                assert isinstance(src_payload, MoeExpertPayload)
+                assert not isinstance(src_payload, str)
                 h_slot_used = None
             else:
                 # Ensure background I/O finished staging into pinned host slot
@@ -274,7 +276,7 @@ class AsyncMoEStreamer:
             t = tiers[l_idx]
             if t == StorageTier.GPU_HBM:
                 payload = self.model.moe_tier_store[l_idx]
-                assert isinstance(payload, MoeExpertPayload)
+                assert not isinstance(payload, str)
                 yield l_idx, payload
             else:
                 if l_idx not in gpu_inflight:
@@ -380,7 +382,7 @@ def model_vram_breakdown(model: LoadedQwen38Model, streamer: "AsyncMoEStreamer |
             + _gpu_tensor_bytes(model.hyper_connection_mixer)
         ) / gib,
         "tier0_moe_gib": _gpu_tensor_bytes(
-            [v for v in model.moe_tier_store.values() if isinstance(v, MoeExpertPayload)]
+            [v for v in model.moe_tier_store.values() if not isinstance(v, str)]
         ) / gib,
         "staging_gib": (_gpu_tensor_bytes(streamer._gpu_slots) / gib) if streamer is not None else 0.0,
         "allocated_gib": 0.0,
@@ -425,7 +427,7 @@ def ensure_vram_headroom(
     weight_dtype = torch.float8_e4m3fn if model.config.is_fp8_experts else model.compute_dtype
     for l_idx in demoted:
         gpu_payload = model.moe_tier_store[l_idx]
-        assert isinstance(gpu_payload, MoeExpertPayload)
+        assert not isinstance(gpu_payload, str)
         alloc_kwargs = dict(
             device="cpu",
             weight_dtype=weight_dtype,
@@ -494,7 +496,10 @@ class Qwen38JLensEngine:
         self.plan = model.plan
         self.device = model.device
         self.dtype = model.compute_dtype
-        self.gdn_backend = GatedDeltaRuleBackend(preferred=self.plan.gdn_backend)
+        self.gdn_backend = GatedDeltaRuleBackend(
+            preferred=self.plan.gdn_backend,
+            max_seq_len=self.plan.max_seq_len,
+        )
         # Verify REAL post-load headroom before allocating staging slots (self-healing OOM guard).
         self.demoted_layers = ensure_vram_headroom(model) if auto_vram_headroom else []
         self.streamer = AsyncMoEStreamer(model)
@@ -631,12 +636,12 @@ class Qwen38JLensEngine:
 
         for l_idx, experts in self.streamer.iter_sweep(range(n_layers)):
             layer_w = self.model.layers[l_idx]
-            for b in range(B):
-                H_b = H_cur[b]
+            if B == 1:
+                H_b = H_cur[0]
                 if l_idx > min_src:
-                    saved_inputs[b][l_idx] = H_b.to("cpu") if offload_to_cpu else H_b
-                cos_b, sin_b = rope_cache[seq_lens[b]]
-                ple_b = ple_embs_list[b].get(l_idx)
+                    saved_inputs[0][l_idx] = H_b.to("cpu") if offload_to_cpu else H_b
+                cos_b, sin_b = rope_cache[seq_lens[0]]
+                ple_b = ple_embs_list[0].get(l_idx)
                 if ple_b is not None and ple_b.device != self.device:
                     ple_b = ple_b.to(self.device)
                 H_next, _ = decoder_layer_fwd(
@@ -651,7 +656,54 @@ class Qwen38JLensEngine:
                     use_triton_dequant=self.plan.use_triton_fp8_dequant,
                     keep_experts_dequantized=False,
                 )
-                H_cur[b] = H_next
+                H_cur[0] = H_next
+            else:
+                # Amortize FP8 expert dequantization & grouped_mm launches across ALL B prompts
+                # via a single concatenated token-wise moe_block_fwd (supports variable seq_lens!).
+                H_mid_list: list[torch.Tensor] = []
+                x_mlp_list: list[torch.Tensor] = []
+                w_mlp_list: list[torch.Tensor] = []
+                for b in range(B):
+                    H_b = H_cur[b]
+                    if l_idx > min_src:
+                        saved_inputs[b][l_idx] = H_b.to("cpu") if offload_to_cpu else H_b
+                    cos_b, sin_b = rope_cache[seq_lens[b]]
+                    ple_b = ple_embs_list[b].get(l_idx)
+                    if ple_b is not None and ple_b.device != self.device:
+                        ple_b = ple_b.to(self.device)
+                    H_mid_b = decoder_layer_attn_fwd(
+                        H_b,
+                        layer_w,
+                        cos_b,
+                        sin_b,
+                        self.gdn_backend,
+                        ple_embeddings=ple_b,
+                    )
+                    x_mlp_b, w_mlp_b, _ = gated_residual_fwd(H_mid_b, layer_w.mlp_hc)
+                    assert w_mlp_b is not None
+                    H_mid_list.append(H_mid_b)
+                    x_mlp_list.append(x_mlp_b)
+                    w_mlp_list.append(w_mlp_b)
+                    H_cur[b] = torch.empty(0)
+
+                x_mlp_cat = torch.cat(x_mlp_list, dim=1)  # [1, sum(T_b), D]
+                del x_mlp_list
+                y_mlp_cat, _ = moe_block_fwd(
+                    x_mlp_cat,
+                    layer_w.moe_dense,
+                    experts,
+                    dequant_chunk_size=self.plan.expert_dequant_chunk,
+                    use_triton_dequant=self.plan.use_triton_fp8_dequant,
+                    keep_dequantized_for_bwd=False,
+                )
+                del x_mlp_cat
+                y_mlp_splits = y_mlp_cat.split(seq_lens, dim=1)
+                for b in range(B):
+                    H_cur[b] = (
+                        H_mid_list[b]
+                        + (y_mlp_splits[b].unsqueeze(-2) * w_mlp_list[b].unsqueeze(-1)).flatten(-2)
+                    )
+                del H_mid_list, w_mlp_list, y_mlp_cat, y_mlp_splits
 
         cached_list: list[_CachedPromptForward] = []
         cpu_dev = torch.device("cpu")
