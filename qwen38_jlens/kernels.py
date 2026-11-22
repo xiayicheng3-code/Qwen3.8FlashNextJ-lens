@@ -1889,23 +1889,40 @@ def verify_cuda_triton_kernels(
     dev = torch.device(device) if device is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
     use_tri = dev.type == "cuda" and _HAS_TRITON
-    tol = 3e-2 if dt == torch.bfloat16 else 1e-4
+    atol_def = 2e-2 if dt == torch.bfloat16 else 1e-4
+    rtol_def = 2e-2 if dt == torch.bfloat16 else 1e-4
     errs: dict[str, float] = {}
 
-    def _chk(name: str, got: torch.Tensor, ref: torch.Tensor, limit: float = tol) -> None:
+    def _chk(
+        name: str,
+        got: torch.Tensor,
+        ref: torch.Tensor,
+        *,
+        atol: float = atol_def,
+        rtol: float = rtol_def,
+    ) -> None:
         assert torch.isfinite(got).all(), f"{name}: non-finite output!"
-        err = float((got.float() - ref.float()).abs().max().item())
+        gf, rf = got.float(), ref.float()
+        diff = (gf - rf).abs()
+        err = float(diff.max().item())
         errs[name] = err
-        assert err <= limit, f"{name} parity failed: max_abs_diff={err:.4e} > {limit:.4e}"
+        ok = torch.allclose(gf, rf, rtol=rtol, atol=atol)
+        if not ok:
+            idx = int(diff.argmax().item())
+            gv, rv = float(gf.reshape(-1)[idx].item()), float(rf.reshape(-1)[idx].item())
+            raise AssertionError(
+                f"{name} parity failed: max_abs_diff={err:.4e} (got={gv:.4f}, ref={rv:.4f}, atol={atol:.2e}, rtol={rtol:.2e})"
+            )
 
-    # 1. FP8 blockwise dequant (128x128)
+    # 1. FP8 blockwise dequant (128x128) — bit-exact on BF16!
     w_fp8 = torch.randn(2, 256, 256, device=dev).to(torch.float8_e4m3fn)
     s_fp32 = torch.rand(2, 2, 2, device=dev, dtype=torch.float32) * 0.1 + 0.01
     _chk(
         "fp8_dequant",
         dequantize_fp8_blockwise(w_fp8, s_fp32, out_dtype=dt, use_triton=use_tri),
         dequantize_fp8_blockwise(w_fp8, s_fp32, out_dtype=dt, use_triton=False),
-        limit=0.0 if dt == torch.bfloat16 else 1e-6,
+        atol=0.0 if dt == torch.bfloat16 else 1e-6,
+        rtol=0.0 if dt == torch.bfloat16 else 1e-6,
     )
 
     # 2. 2D-tiled SwiGLU VJP pack
@@ -1991,7 +2008,7 @@ def verify_cuda_triton_kernels(
         hc_inject_vjp_fused(G_s, y_s, w_s, dy_r, dw_r, tk_layout=tk_flag, use_triton=False)
         tag = "tk" if tk_flag else "kt"
         _chk(f"hc_inject_dy_{tag}", dy_t, dy_r)
-        _chk(f"hc_inject_dw_{tag}", dw_t, dw_r, limit=6e-2 if dt == torch.bfloat16 else 1e-4)
+        _chk(f"hc_inject_dw_{tag}", dw_t, dw_r, atol=3e-2 if dt == torch.bfloat16 else 1e-4)
 
     # 7 & 8. MoE gather+scale and zero-atomic scatter-add (unchunked AND 2-chunked!)
     top_k = 8
@@ -2019,7 +2036,7 @@ def verify_cuda_triton_kernels(
             moe_scatter_add_tk_fused(
                 dst_r, dX_s[r0:r1], inv_2d, r0, 16, 48, sub_tok=tok_sorted[r0:r1], use_triton=False
             )
-        _chk(f"moe_scatter_add_{mode_lbl}", dst_t, dst_r, limit=4e-2 if dt == torch.bfloat16 else 1e-4)
+        _chk(f"moe_scatter_add_{mode_lbl}", dst_t, dst_r, atol=3e-2 if dt == torch.bfloat16 else 1e-4)
 
     # 9. L2Norm VJP (D=128)
     x_l2 = torch.randn(1, T_t, 16, 128, device=dev, dtype=dt) * 0.3
@@ -2045,7 +2062,7 @@ def verify_cuda_triton_kernels(
         "causal_conv1d_silu_bwd",
         causal_conv1d_silu_bwd_qkv_ktc(dq_c, dk_c, dv_c, pre_full[:, :, s_conv:], w_conv, use_triton=use_tri),
         causal_conv1d_silu_bwd_qkv_ktc(dq_c, dk_c, dv_c, pre_full[:, :, s_conv:], w_conv, use_triton=False),
-        limit=4e-2 if dt == torch.bfloat16 else 1e-4,
+        atol=3e-2 if dt == torch.bfloat16 else 1e-4,
     )
 
     # 11. L2-Cached Exact WY GDN (T=128, bwd_start=16) vs chunked PyTorch autograd
@@ -2066,13 +2083,14 @@ def verify_cuda_triton_kernels(
         b_r = b_w.expand(4, -1, -1).clone().requires_grad_(True)
         o_r = torch_chunk_gated_delta_rule(q_r, k_r, v_r, g_r, b_r, use_qk_l2norm_in_kernel=True)
         dq_r, dk_r, dv_r, dg_r, db_r = torch.autograd.grad(o_r, (q_r, k_r, v_r, g_r, b_r), grad_outputs=do_full)
-    wy_lim = 1e-1 if dt == torch.bfloat16 else 2e-4
-    _chk("wy_gdn_fwd", o_wy, o_r[:1], limit=5e-2 if dt == torch.bfloat16 else 1e-4)
-    _chk("wy_gdn_dq", dq_wy, dq_r[:, s_conv:], limit=wy_lim)
-    _chk("wy_gdn_dk", dk_wy, dk_r[:, s_conv:], limit=wy_lim)
-    _chk("wy_gdn_dv", dv_wy, dv_r[:, s_conv:], limit=wy_lim)
-    _chk("wy_gdn_dg", dg_wy, dg_r[:, s_conv:], limit=wy_lim)
-    _chk("wy_gdn_db", db_wy, db_r[:, s_conv:], limit=wy_lim)
+    wy_atol = 5e-2 if dt == torch.bfloat16 else 2e-4
+    wy_rtol = 4e-2 if dt == torch.bfloat16 else 1e-3
+    _chk("wy_gdn_fwd", o_wy, o_r[:1], atol=3e-2 if dt == torch.bfloat16 else 1e-4, rtol=wy_rtol)
+    _chk("wy_gdn_dq", dq_wy, dq_r[:, s_conv:], atol=wy_atol, rtol=wy_rtol)
+    _chk("wy_gdn_dk", dk_wy, dk_r[:, s_conv:], atol=wy_atol, rtol=wy_rtol)
+    _chk("wy_gdn_dv", dv_wy, dv_r[:, s_conv:], atol=wy_atol, rtol=wy_rtol)
+    _chk("wy_gdn_dg", dg_wy, dg_r[:, s_conv:], atol=wy_atol, rtol=wy_rtol)
+    _chk("wy_gdn_db", db_wy, db_r[:, s_conv:], atol=wy_atol, rtol=wy_rtol)
 
     if dev.type == "cuda":
         torch.cuda.synchronize(dev)
